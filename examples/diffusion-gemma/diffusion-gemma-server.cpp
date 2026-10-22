@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <functional>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -123,6 +124,28 @@ struct diffusion_request {
     bool     topk_tail     = false;
     bool     ignore_eos    = false; // run all max_canvases blocks (don't stop at end-of-text)
     uint32_t seed          = 1234;
+
+    // ATK patch 2: the sampler's reference constants, overridable per request ("atk_sampler").
+    float    entropy_bound = ENTROPY_BOUND;        // uncertainty committed per step (Algorithm 1, b)
+    float    stop_entropy  = CONFIDENCE_THRESHOLD; // adaptive stopping: mean entropy below this ...
+    float    temp_max      = TEMP_MAX;             // ... temperature annealed from temp_max ...
+    float    temp_min      = TEMP_MIN;             // ... to temp_min across the schedule
+
+    // ATK patch 2: the FIRST canvas laid out by the client ("atk_canvas"). Positions with a token
+    // >= 0 start as that token; -1 starts random, as every position does without this. Held
+    // positions are put back after every step, so the model writes only the rest, seeing the held
+    // text on both sides. `canvas_noise` scrambles that fraction of the given, unheld tokens before
+    // the first step, and the schedule starts at that point of the noise path (t = noise): 1.0 is
+    // "from noise", 0.3 is "this draft, lightly re-noised".
+    bool                     has_canvas   = false;
+    std::vector<llama_token> canvas_init;
+    std::vector<char>        canvas_hold;
+    float                    canvas_noise = 1.0f;
+    // ATK patch 2: return the first canvas as tokens, text pieces, final per-position entropy and
+    // how often each position's best guess changed ("atk_readout"; always on with atk_canvas).
+    bool                     readout      = false;
+    // ATK patch 2: keep the KV of the longest prompt prefix shared with the previous request.
+    bool                     cache_prompt = true;
 };
 
 struct diffusion_result {
@@ -138,7 +161,66 @@ struct diffusion_result {
     double gen_ms          = 0.0;  // denoising block-loop wall time
     bool   ok              = false;
     std::string error;
+    // ATK patch: the thought channel (text before the last "<channel|>"), whether an end-of-
+    // generation token ended the answer (false = the canvases ran out: finish_reason "length"),
+    // and whether the client went away mid-generation.
+    std::string thought;
+    bool   hit_eog         = false;
+    bool   cancelled       = false;
+    // ATK patch 2: prompt tokens whose KV was reused from the previous request
+    int    cached_tokens   = 0;
+    // ATK patch 2: the first canvas, read out (see diffusion_request::readout)
+    bool                     has_readout = false;
+    std::vector<llama_token> canvas0;
+    std::vector<float>       canvas0_entropy;
+    std::vector<int>         canvas0_flips;
+    int                      canvas0_steps = 0;
+    int                      canvas0_start = 0;
 };
+
+// ATK patch: called from inside generate(). on_step runs before every denoising step and
+// on_block after every finished canvas block (with that block's tokens); either returning
+// false stops the generation (the client disconnected).
+struct diffusion_hooks {
+    std::function<bool(int block, int step, int n_steps)>               on_step;
+    std::function<bool(int block, const std::vector<llama_token> & toks)> on_block;
+};
+
+// ------------------------------------------------------------------------------------------------
+// ATK patch: the answer-extraction rule, shared by the final result and the streamed partial answer
+// ------------------------------------------------------------------------------------------------
+struct diffusion_answer {
+    std::vector<llama_token> answer;    // after the last "<channel|>", up to the first eog token
+    std::vector<llama_token> thought;   // before that "<channel|>" (empty when there is none)
+    bool hit_eog    = false;            // an eog token ended the answer
+    bool in_thought = false;            // a thought channel was opened and has not been closed yet
+};
+
+static llama_token diffusion_single_token(const llama_vocab * vocab, const char * text) {
+    const std::vector<llama_token> t = common_tokenize(vocab, text, false, true);
+    return t.size() == 1 ? t[0] : LLAMA_TOKEN_NULL;
+}
+
+static diffusion_answer diffusion_extract(const llama_vocab * vocab, const std::vector<llama_token> & generated,
+                                          llama_token chan_open, llama_token chan_close) {
+    diffusion_answer a;
+    const int n_gen = (int) generated.size();
+    int start = 0;
+    if (chan_close != LLAMA_TOKEN_NULL) {
+        for (int j = 0; j < n_gen; ++j) if (generated[j] == chan_close) start = j + 1;
+    }
+    if (start == 0 && chan_open != LLAMA_TOKEN_NULL) {
+        for (int j = 0; j < n_gen && !llama_vocab_is_eog(vocab, generated[j]); ++j) {
+            if (generated[j] == chan_open) { a.in_thought = true; break; }
+        }
+    }
+    for (int j = start; j < n_gen; ++j) {
+        if (llama_vocab_is_eog(vocab, generated[j])) { a.hit_eog = true; break; }
+        a.answer.push_back(generated[j]);
+    }
+    if (start > 1) a.thought.assign(generated.begin(), generated.begin() + (start - 1));
+    return a;
+}
 
 // ------------------------------------------------------------------------------------------------
 // server metrics (llama-server analogue; protected by its own mutex)
@@ -213,10 +295,19 @@ struct diffusion_server {
     common_params_diffusion diffusion;
     std::string model_id;
     std::string model_path;
-    std::string build_info = "llama.cpp diffusion-gemma-server";
+    std::string build_info = "llama.cpp diffusion-gemma-server (PR #24427) + ATK patch 2";
 
     server_metrics metrics;
     std::mutex gen_mutex;            // serialize generation (ctx is single-threaded == one slot)
+
+    // ATK patch 2: what the KV cache holds, position by position (the last prompt plus the
+    // canvases committed after it). Empty = nothing known, so the next request starts clean.
+    std::vector<llama_token> kv_tokens;
+
+    void invalidate_kv() {
+        llama_memory_clear(mem, true);
+        kv_tokens.clear();
+    }
 
     std::string format_messages(const json & messages) const {
         common_chat_templates_inputs inputs;
@@ -252,7 +343,8 @@ struct diffusion_server {
     }
 
     // run the block-diffusion denoising loop for one request (mirrors diffusion-gemma-cli.cpp)
-    diffusion_result generate(const std::vector<llama_token> & prompt_tokens, const diffusion_request & rq) {
+    diffusion_result generate(const std::vector<llama_token> & prompt_tokens, const diffusion_request & rq,
+                              const diffusion_hooks * hooks = nullptr) {
         diffusion_result out;
         const int prefix_len = (int) prompt_tokens.size();
         int n_decode = 0;
@@ -268,7 +360,24 @@ struct diffusion_server {
         if (max_canvases > fit) max_canvases = fit;
         if (max_canvases < 1)   max_canvases = 1;
 
-        llama_memory_clear(mem, true);
+        // ATK patch 2: PROMPT CACHE. The encoder is causal, so the K/V of a prompt prefix depends
+        // on that prefix alone, and a request that starts with the same tokens as the last one
+        // (a chat's history, Cognitive Coder's fixed system prompt and interfaces) need not
+        // encode them again. The cache is full-size (the context default swa_full = true), so
+        // dropping its tail is exact; if the memory refuses the partial removal, start clean.
+        int reuse = 0;
+        if (rq.cache_prompt && !kv_tokens.empty()) {
+            const int lim = std::min((int) kv_tokens.size(), prefix_len);
+            while (reuse < lim && kv_tokens[reuse] == prompt_tokens[reuse]) ++reuse;
+        }
+        if (reuse > 0 && !llama_memory_seq_rm(mem, 0, reuse, -1)) {
+            reuse = 0;
+        }
+        if (reuse == 0) {
+            llama_memory_clear(mem, true);
+        }
+        kv_tokens.assign(prompt_tokens.begin(), prompt_tokens.begin() + reuse);
+        out.cached_tokens = reuse;
 
         std::mt19937 rng(rq.seed);
         std::uniform_int_distribution<int> rand_tok(0, n_vocab - 1);
@@ -276,15 +385,35 @@ struct diffusion_server {
 
         // ---- ENCODER phase: prefill the prompt prefix (causal, no self-conditioning) ----
         const auto t_prefill0 = std::chrono::steady_clock::now();
-        int n_past = 0;
-        if (prefix_len > 0) {
-            if (!prefill_causal(prompt_tokens, 0, &n_decode)) {
+        int n_past = reuse;
+        if (prefix_len > reuse) {
+            const std::vector<llama_token> rest(prompt_tokens.begin() + reuse, prompt_tokens.end());
+            if (!prefill_causal(rest, reuse, &n_decode)) {
+                invalidate_kv();
                 out.error = "prompt prefill (encoder) decode failed";
                 return out;
             }
             n_past = prefix_len;
         }
+        kv_tokens = prompt_tokens;
         out.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_prefill0).count();
+
+        // ATK patch 2: the client's first canvas, checked before any denoising
+        if (rq.has_canvas && ((int) rq.canvas_init.size() > canvas_length ||
+                              rq.canvas_hold.size() != rq.canvas_init.size())) {
+            out.error = "atk_canvas: " + std::to_string(rq.canvas_init.size()) + " tokens for a " +
+                        std::to_string(canvas_length) + "-token canvas, or hold of a different length";
+            return out;
+        }
+        for (size_t i = 0; rq.has_canvas && i < rq.canvas_init.size(); ++i) {
+            if (rq.canvas_hold[i] && (rq.canvas_init[i] < 0 || rq.canvas_init[i] >= n_vocab)) {
+                out.error = "atk_canvas: position " + std::to_string(i) + " is held but has no token";
+                return out;
+            }
+        }
+        const bool want_readout = rq.readout || rq.has_canvas;
+        std::vector<int>   flips0;
+        std::vector<float> entropy0;
 
         std::vector<llama_token> canvas(canvas_length);
         std::vector<llama_token> argmax_canvas(canvas_length, -1);
@@ -314,9 +443,45 @@ struct diffusion_server {
             std::fill(prev_argmax.begin(), prev_argmax.end(), -1);
             llama_set_diffusion_self_cond_topk(ctx, nullptr, nullptr, 0, 0);
 
-            for (int cur_step = n_steps; cur_step >= 1; --cur_step) {
+            // ATK patch 2: lay out the client's first canvas, and where on the noise path to start
+            const bool laid = block == 0 && rq.has_canvas;
+            const bool watch = block == 0 && want_readout;
+            int start_step = n_steps;
+            int n_free = canvas_length;
+            if (laid) {
+                n_free = 0;
+                for (size_t i = 0; i < rq.canvas_init.size(); ++i) {
+                    const llama_token t = rq.canvas_init[i];
+                    if (rq.canvas_hold[i]) {
+                        canvas[i] = t;
+                    } else {
+                        ++n_free;
+                        if (t >= 0 && t < n_vocab && rand_unif(rng) >= rq.canvas_noise) canvas[i] = t;
+                    }
+                }
+                n_free += canvas_length - (int) rq.canvas_init.size();
+                const float noise = std::min(std::max(rq.canvas_noise, 0.0f), 1.0f);
+                start_step = std::max(1, std::min(n_steps, (int) lroundf(noise * (float) n_steps)));
+            }
+            if (watch) {
+                flips0.assign(canvas_length, 0);
+                entropy0.assign(canvas_length, 0.0f);
+                out.canvas0_start = start_step;
+            }
+            auto is_held = [&](int i) {
+                return laid && i < (int) rq.canvas_hold.size() && rq.canvas_hold[i];
+            };
+
+            for (int cur_step = start_step; cur_step >= 1; --cur_step) {
+                if (hooks && hooks->on_step && !hooks->on_step(block, start_step - cur_step + 1, start_step)) {
+                    llama_memory_seq_rm(mem, 0, n_past, -1);
+                    out.cancelled = true;
+                    out.error = "cancelled: the client went away";
+                    return out;
+                }
                 ++n_steps_total;
-                const float temp = TEMP_MIN + (TEMP_MAX - TEMP_MIN) * ((float) cur_step / (float) n_steps);
+                if (watch) ++out.canvas0_steps;
+                const float temp = rq.temp_min + (rq.temp_max - rq.temp_min) * ((float) cur_step / (float) n_steps);
 
                 int k_step = 0;
                 if (rq.topk_start > 0 && rq.topk_end > 0) {
@@ -329,7 +494,11 @@ struct diffusion_server {
                 const bool use_gpu_sampling_step = use_gpu_sampling &&
                     (k_step <= 0 || k_step <= GPU_SAMPLING_MAX_TOP_K);
                 const bool use_device_self_cond_step = use_gpu_sampling_step && use_device_self_cond;
-                const bool use_device_loop_step = use_device_loop_request && use_gpu_sampling_step;
+                // ATK patch 2: a laid-out or read-out canvas is updated on the host, where held
+                // positions can be put back and per-position entropy is visible. Self-conditioning
+                // stays wherever the server keeps it (on the card with the fused input), so the
+                // only cost is copying 256 tokens and their entropies per step.
+                const bool use_device_loop_step = use_device_loop_request && use_gpu_sampling_step && !watch;
 
                 llama_set_causal_attn(ctx, false);
                 llama_set_diffusion_decoder_phase(ctx, true);
@@ -343,6 +512,7 @@ struct diffusion_server {
                     batch.logits[j]    = 1;
                 }
                 if (llama_decode(ctx, batch) != 0) {
+                    invalidate_kv();
                     out.error = "llama_decode failed at denoising step " + std::to_string(cur_step);
                     return out;
                 }
@@ -380,8 +550,8 @@ struct diffusion_server {
                         /* .self_cond_probs = */ nullptr,
                         /* .final_tokens    = */ (cur_step == 1 || check_stop) ? argmax_canvas.data() : nullptr,
                         /* .stop            = */ check_stop ? &stop_flag : nullptr,
-                        /* .entropy_bound   = */ ENTROPY_BOUND,
-                        /* .confidence_threshold = */ CONFIDENCE_THRESHOLD,
+                        /* .entropy_bound   = */ rq.entropy_bound,
+                        /* .confidence_threshold = */ rq.stop_entropy,
                         /* .stability_threshold  = */ STABILITY_THRESHOLD,
                         /* .update_canvas_on_device = */ cur_step > 1,
                         /* .update_stop_state_on_device = */ use_device_early_stop,
@@ -531,20 +701,38 @@ struct diffusion_server {
 
                 llama_memory_seq_rm(mem, 0, n_past, -1);
 
+                // ATK patch 2: a held position is certain by definition: it IS the held token, it
+                // spends none of the entropy budget, and it does not count toward stopping.
+                float ent_sum = 0.0f;
+                for (int i = 0; i < canvas_length; ++i) {
+                    if (is_held(i)) {
+                        entropy[i] = 0.0f;
+                        sampled[i] = argmax_canvas[i] = rq.canvas_init[i];
+                    } else {
+                        ent_sum += entropy[i];
+                    }
+                }
+                if (watch) {
+                    for (int i = 0; i < canvas_length; ++i) {
+                        if (prev_argmax[i] >= 0 && prev_argmax[i] != argmax_canvas[i]) ++flips0[i];
+                    }
+                    entropy0 = entropy;
+                }
+
                 std::vector<int> order(canvas_length);
                 std::iota(order.begin(), order.end(), 0);
                 std::sort(order.begin(), order.end(), [&](int a, int b) { return entropy[a] < entropy[b]; });
                 std::vector<char> accept_mask(canvas_length, 0);
                 float prefix = 0.0f;
                 for (int k = 0; k < canvas_length; ++k) {
-                    if (prefix <= ENTROPY_BOUND) { accept_mask[order[k]] = 1; prefix += entropy[order[k]]; }
+                    if (prefix <= rq.entropy_bound) { accept_mask[order[k]] = 1; prefix += entropy[order[k]]; }
                     else break;
                 }
                 for (int i = 0; i < canvas_length; ++i) if (accept_mask[i]) accepted[i] = sampled[i];
 
-                const float mean_ent = std::accumulate(entropy.begin(), entropy.end(), 0.0f) / canvas_length;
+                const float mean_ent = ent_sum / (float) std::max(1, n_free);
                 const bool stable    = (STABILITY_THRESHOLD == 0) || (argmax_canvas == prev_argmax);
-                const bool confident = mean_ent < CONFIDENCE_THRESHOLD;
+                const bool confident = mean_ent < rq.stop_entropy;
                 if (stable && confident) break;
                 prev_argmax = argmax_canvas;
 
@@ -553,6 +741,15 @@ struct diffusion_server {
                 }
 
                 for (int i = 0; i < canvas_length; ++i) canvas[i] = accept_mask[i] ? accepted[i] : rand_tok(rng);
+                for (int i = 0; laid && i < (int) rq.canvas_hold.size(); ++i) {
+                    if (rq.canvas_hold[i]) canvas[i] = rq.canvas_init[i];
+                }
+            }
+            if (watch) {
+                out.has_readout     = true;
+                out.canvas0         = argmax_canvas;
+                out.canvas0_entropy = entropy0;
+                out.canvas0_flips   = flips0;
             }
 
             const std::vector<llama_token> & block_out = argmax_canvas;
@@ -562,33 +759,31 @@ struct diffusion_server {
                     if (llama_vocab_is_eog(vocab, block_out[j])) { done = true; break; }
                 }
             }
+            if (hooks && hooks->on_block && !hooks->on_block(block, block_out)) {
+                out.cancelled = true;
+                out.error = "cancelled: the client went away";
+                return out;
+            }
             if (!done && block + 1 < max_canvases) {
                 if (!prefill_causal(block_out, n_past, &n_decode)) {
+                    invalidate_kv();
                     out.error = "canvas commit (encoder) decode failed";
                     return out;
                 }
                 n_past += canvas_length;
+                kv_tokens.insert(kv_tokens.end(), block_out.begin(), block_out.end());
             }
         }
         out.gen_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_gen0).count();
         out.full   = common_detokenize(vocab, generated, false);
 
         // extract the final response: after the last "<channel|>" close, until the first eog token
-        llama_token chan_close = LLAMA_TOKEN_NULL;
-        {
-            auto t = common_tokenize(vocab, "<channel|>", false, true);
-            if (t.size() == 1) chan_close = t[0];
-        }
-        const int n_gen = (int) generated.size();
-        int start = 0;
-        if (chan_close != LLAMA_TOKEN_NULL) {
-            for (int j = 0; j < n_gen; ++j) if (generated[j] == chan_close) start = j + 1;
-        }
-        std::vector<llama_token> answer;
-        for (int j = start; j < n_gen; ++j) {
-            if (llama_vocab_is_eog(vocab, generated[j])) break;
-            answer.push_back(generated[j]);
-        }
+        // (ATK patch: the rule lives in diffusion_extract so the streamed partial answer uses it too)
+        const diffusion_answer ex = diffusion_extract(vocab, generated,
+            diffusion_single_token(vocab, "<|channel>"), diffusion_single_token(vocab, "<channel|>"));
+        const std::vector<llama_token> & answer = ex.answer;
+        out.hit_eog = ex.hit_eog;
+        if (!ex.thought.empty()) out.thought = common_detokenize(vocab, ex.thought, false);
         std::string ans = common_detokenize(vocab, answer, false);
         {
             std::string s = ans;
@@ -629,7 +824,7 @@ static json timings_json(const diffusion_result & r) {
     const double cps = r.gen_ms        > 0 ? r.canvas_tokens * 1e3 / r.gen_ms : 0.0;
     const double mps = r.n_steps_total > 0 ? r.gen_ms / r.n_steps_total : 0.0;
     return json{
-        {"cache_n", 0},
+        {"cache_n", r.cached_tokens},              // ATK patch 2: prompt tokens reused from the cache
         {"prompt_n", r.prompt_tokens},
         {"prompt_ms", r.prefill_ms},
         {"prompt_per_token_ms", ppt},
@@ -656,7 +851,7 @@ static json usage_json(const diffusion_result & r) {
         {"prompt_tokens", r.prompt_tokens},
         {"completion_tokens", r.canvas_tokens},
         {"total_tokens", r.prompt_tokens + r.canvas_tokens},
-        {"prompt_tokens_details", {{"cached_tokens", 0}}},
+        {"prompt_tokens_details", {{"cached_tokens", r.cached_tokens}}},
         {"completion_tokens_details", {{"reasoning_tokens", reasoning > 0 ? reasoning : 0}}},
     };
 }
@@ -668,8 +863,8 @@ static void log_timings(const diffusion_result & r) {
     const double mps = r.n_steps_total > 0 ? r.gen_ms / r.n_steps_total : 0.0;
     const double sps = r.gen_ms        > 0 ? r.n_steps_total * 1e3 / r.gen_ms : 0.0;
     const double cps = r.gen_ms        > 0 ? r.canvas_tokens * 1e3 / r.gen_ms : 0.0;
-    SLT_INF(0, "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-            r.prefill_ms, r.prompt_tokens, ppt, pps);
+    SLT_INF(0, "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second), %d reused\n",
+            r.prefill_ms, r.prompt_tokens, ppt, pps, r.cached_tokens);
     SLT_INF(0, "    denoise time = %10.2f ms / %5d steps  (%8.2f ms per step,  %8.2f steps per second)\n",
             r.gen_ms, r.n_steps_total, mps, sps);
     SLT_INF(0, "      gen tokens = %5d answer | %5d canvas over %d block(s) (%8.2f canvas tok/s)\n",
@@ -714,7 +909,55 @@ static diffusion_request request_from_body(const json & body, const diffusion_se
     }
     if (body.contains("seed")  && body["seed"].is_number_integer()) rq.seed = (uint32_t) body["seed"].get<int64_t>();
     if (body.contains("ignore_eos") && body["ignore_eos"].is_boolean()) rq.ignore_eos = body["ignore_eos"].get<bool>();
+
+    // ---- ATK patch 2 -------------------------------------------------------------------------
+    if (body.contains("atk_sampler") && body["atk_sampler"].is_object()) {
+        const json & sm = body["atk_sampler"];
+        auto num = [&](const char * k, float & dst, float lo, float hi) {
+            if (sm.contains(k) && sm[k].is_number()) dst = std::min(std::max(sm[k].get<float>(), lo), hi);
+        };
+        num("entropy_bound", rq.entropy_bound, 0.0f, 1000.0f);
+        num("stop_entropy",  rq.stop_entropy,  0.0f, 1000.0f);
+        num("temp_max",      rq.temp_max,      0.01f, 10.0f);
+        num("temp_min",      rq.temp_min,      0.01f, 10.0f);
+    }
+    if (body.contains("atk_canvas") && body["atk_canvas"].is_object()) {
+        const json & cv = body["atk_canvas"];
+        rq.has_canvas = true;
+        if (cv.contains("tokens") && cv["tokens"].is_array()) {
+            for (const auto & t : cv["tokens"]) rq.canvas_init.push_back(t.is_number_integer() ? (llama_token) t.get<int64_t>() : -1);
+        }
+        if (cv.contains("hold") && cv["hold"].is_array()) {
+            for (const auto & h : cv["hold"]) rq.canvas_hold.push_back((char) ((h.is_boolean() && h.get<bool>()) || (h.is_number_integer() && h.get<int64_t>() != 0)));
+        } else {
+            rq.canvas_hold.assign(rq.canvas_init.size(), 0);
+        }
+        if (cv.contains("noise") && cv["noise"].is_number()) rq.canvas_noise = std::min(std::max(cv["noise"].get<float>(), 0.0f), 1.0f);
+    }
+    if (body.contains("atk_readout") && body["atk_readout"].is_boolean()) rq.readout = body["atk_readout"].get<bool>();
+    if (body.contains("atk_cache_prompt") && body["atk_cache_prompt"].is_boolean()) rq.cache_prompt = body["atk_cache_prompt"].get<bool>();
     return rq;
+}
+
+// ATK patch 2: the first canvas as the client asked to see it (atk_canvas / atk_readout)
+// Each token's text goes out as HEX: a byte-fallback token is part of a UTF-8 character, which
+// is not a valid JSON string on its own; the client joins the bytes and decodes the whole.
+static json readout_json(const diffusion_server & srv, const diffusion_result & r) {
+    static const char * HEX = "0123456789abcdef";
+    json pieces = json::array(), eog = json::array();
+    for (const llama_token t : r.canvas0) {
+        const std::string raw = common_token_to_piece(srv.vocab, t, false);
+        std::string hex;
+        hex.reserve(raw.size() * 2);
+        for (const unsigned char c : raw) { hex.push_back(HEX[c >> 4]); hex.push_back(HEX[c & 15]); }
+        pieces.push_back(hex);
+        eog.push_back(llama_vocab_is_eog(srv.vocab, t));
+    }
+    return json{
+        {"tokens", r.canvas0}, {"pieces_hex", pieces}, {"eog", eog},
+        {"entropy", r.canvas0_entropy}, {"flips", r.canvas0_flips},
+        {"steps", r.canvas0_steps}, {"start_step", r.canvas0_start},
+    };
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -771,6 +1014,12 @@ int main(int argc, char ** argv) {
     model_params.use_mmap     = params.use_mmap;
     model_params.use_extra_bufts = !params.no_extra_bufts;
     model_params.no_host         = params.no_host;
+    // ATK patch: -ot / --cpu-moe / --n-cpu-moe are parsed by common_params_parse but were never
+    // handed to the loader, so a MoE model could not keep its experts in system RAM. The parser
+    // pads the list with {nullptr, nullptr} terminators, which is what the loader expects.
+    model_params.tensor_buft_overrides =
+        (params.tensor_buft_overrides.empty() || params.tensor_buft_overrides.front().pattern == nullptr)
+            ? nullptr : params.tensor_buft_overrides.data();
 
     diffusion_server srv;
     srv.model = llama_model_load_from_file(params.model.path.c_str(), model_params);
@@ -815,6 +1064,7 @@ int main(int argc, char ** argv) {
     ctx_params.n_batch  = srv.n_ub;
     ctx_params.n_ubatch = srv.n_ub;
     ctx_params.no_perf  = params.no_perf;
+    ctx_params.op_offload = !params.no_op_offload;   // ATK patch: honour --no-op-offload
     ctx_params.diffusion_self_cond_top_k = srv.diffusion.self_cond_top_k;
     ctx_params.diffusion_input_gpu_groups = srv.diffusion.input_gpu_groups;
     ctx_params.diffusion_fused_self_cond_embd = srv.diffusion.fused_self_cond_embd;
@@ -950,6 +1200,8 @@ int main(int argc, char ** argv) {
                 {"top_k_end", srv.topk_end},
                 {"top_k_tail_correction", srv.topk_tail},
             }},
+            // ATK patch 2: what this build accepts beyond the PR's own server
+            {"atk", {{"patch", 2}, {"canvas", true}, {"readout", true}, {"sampler", true}, {"prompt_cache", true}}},
             {"total_slots", 1},
             {"model_path", srv.model_path},
             {"model_alias", srv.model_id},
@@ -1075,11 +1327,12 @@ int main(int argc, char ** argv) {
     }
 
     // shared: run one generation (under the slot mutex), update metrics, print timing log
-    auto run_for_body = [&srv, default_seed](const json & body, const std::vector<llama_token> & prompt_tokens) {
+    auto run_for_body = [&srv, default_seed](const json & body, const std::vector<llama_token> & prompt_tokens,
+                                             const diffusion_hooks * hooks = nullptr) {
         diffusion_request rq = request_from_body(body, srv, default_seed);
         srv.metrics.n_processing.fetch_add(1);
         std::unique_lock<std::mutex> lock(srv.gen_mutex);
-        diffusion_result r = srv.generate(prompt_tokens, rq);
+        diffusion_result r = srv.generate(prompt_tokens, rq, hooks);
         lock.unlock();
         srv.metrics.n_processing.fetch_sub(1);
         if (r.ok) { srv.metrics.add(r); log_timings(r); }
@@ -1111,7 +1364,8 @@ int main(int argc, char ** argv) {
                 {"usage", usage_json(r)},
                 {"timings", timings_json(r)},
             };
-            res.set_content(out.dump(), "application/json");
+            // ATK patch 2: replace, never throw, on a reply that ends inside a UTF-8 character
+            res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
             return;
         }
 
@@ -1124,7 +1378,7 @@ int main(int argc, char ** argv) {
         const bool include_usage = body.value("stream_options", json::object()).value("include_usage", false);
         res.set_chunked_content_provider("text/event-stream",
             [id, created, model_id, answer, timings, usage, include_usage](size_t, httplib::DataSink & sink) {
-                auto send = [&](const json & c) { std::string s = "data: " + c.dump() + "\n\n"; return sink.write(s.data(), s.size()); };
+                auto send = [&](const json & c) { std::string s = "data: " + c.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n"; return sink.write(s.data(), s.size()); };
                 auto chunk = [&](const json & delta, const char * finish, const json * extra) {
                     json c{{"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", model_id},
                            {"choices", json::array({ json{{"index", 0}, {"delta", delta}, {"finish_reason", finish ? json(finish) : json(nullptr)}} })}};
@@ -1153,15 +1407,96 @@ int main(int argc, char ** argv) {
         const std::string prompt = body["prompt"].get<std::string>();
         const std::vector<llama_token> prompt_tokens = common_tokenize(srv.vocab, prompt, true, true);
 
-        const diffusion_result r = run_for_body(body, prompt_tokens);
-        if (!r.ok) { res.status = 500; res.set_content(error_json(r.error, "server_error", 500).dump(), "application/json"); return; }
-        json out{
-            {"id", gen_id("cmpl")}, {"object", "text_completion"}, {"created", (int64_t) std::time(nullptr)}, {"model", srv.model_id},
-            {"choices", json::array({ json{{"index", 0}, {"text", r.answer}, {"finish_reason", "stop"}} })},
-            {"usage", usage_json(r)},
-            {"timings", timings_json(r)},
+        // ATK patch: the finished answer carries what a caller needs to tell a cut-off reply from a
+        // finished one, and the thought channel when the model wrote one.
+        auto final_choice = [](const diffusion_result & r) {
+            json c{{"index", 0}, {"text", r.answer}, {"finish_reason", r.hit_eog ? "stop" : "length"}};
+            if (!r.thought.empty()) c["reasoning_content"] = r.thought;
+            return c;
         };
-        res.set_content(out.dump(), "application/json");
+
+        if (!body.value("stream", false)) {
+            const diffusion_result r = run_for_body(body, prompt_tokens);
+            if (!r.ok) { res.status = 500; res.set_content(error_json(r.error, "server_error", 500).dump(), "application/json"); return; }
+            json out{
+                {"id", gen_id("cmpl")}, {"object", "text_completion"}, {"created", (int64_t) std::time(nullptr)}, {"model", srv.model_id},
+                {"choices", json::array({ final_choice(r) })},
+                {"usage", usage_json(r)},
+                {"timings", timings_json(r)},
+            };
+            if (r.has_readout) out["atk_canvas_out"] = readout_json(srv, r);
+            // ATK patch 2: a reply can end inside a UTF-8 character (a canvas boundary, a byte-
+            // fallback token); dump() would throw on it, so such bytes become U+FFFD instead
+            res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
+            return;
+        }
+
+        // ATK patch: stream=true runs the generation INSIDE the response, so the client sees every
+        // denoising step ("atk_progress") and every finished 256-token block ("atk_block": the answer
+        // so far by the same rule as the final one, or in_thought while a thought channel is open, and
+        // the thought once it has closed),
+        // then the final answer as the one "choices" chunk. A client that disconnects stops the
+        // generation at the next step.
+        const std::string id = gen_id("cmpl");
+        const int64_t created = (int64_t) std::time(nullptr);
+        res.set_chunked_content_provider("text/event-stream",
+            [&srv, &run_for_body, body, prompt_tokens, id, created, final_choice](size_t, httplib::DataSink & sink) {
+                auto send = [&](const json & c) {
+                    // ATK patch 2: replace, never throw, on a partial UTF-8 character (see above)
+                    const std::string s = "data: " + c.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                    return sink.write(s.data(), s.size());
+                };
+                diffusion_hooks hooks;
+                hooks.on_step = [&](int block, int step, int n_steps) {
+                    return send(json{{"atk_progress", {{"block", block}, {"step", step}, {"n_steps", n_steps}}}});
+                };
+                std::vector<llama_token> so_far;
+                const llama_token chan_open  = diffusion_single_token(srv.vocab, "<|channel>");
+                const llama_token chan_close = diffusion_single_token(srv.vocab, "<channel|>");
+                hooks.on_block = [&](int block, const std::vector<llama_token> & toks) {
+                    so_far.insert(so_far.end(), toks.begin(), toks.end());
+                    const diffusion_answer a = diffusion_extract(srv.vocab, so_far, chan_open, chan_close);
+                    json ev{
+                        {"index", block},
+                        {"in_thought", a.in_thought},
+                        {"hit_eog", a.hit_eog},
+                        {"answer_so_far", a.in_thought ? std::string() : common_detokenize(srv.vocab, a.answer, false)},
+                    };
+                    if (!a.thought.empty()) ev["thought"] = common_detokenize(srv.vocab, a.thought, false);
+                    return send(json{{"atk_block", ev}});
+                };
+                const diffusion_result r = run_for_body(body, prompt_tokens, &hooks);
+                if (r.cancelled) {
+                    SRV_INF("%s\n", "generation stopped: the client went away");
+                    return false;
+                }
+                if (!r.ok) {
+                    send(error_json(r.error, "server_error", 500));
+                } else {
+                    json fin{{"id", id}, {"object", "text_completion"}, {"created", created}, {"model", srv.model_id},
+                             {"choices", json::array({ final_choice(r) })},
+                             {"usage", usage_json(r)}, {"timings", timings_json(r)}};
+                    if (r.has_readout) fin["atk_canvas_out"] = readout_json(srv, r);
+                    send(fin);
+                }
+                const std::string done = "data: [DONE]\n\n";
+                sink.write(done.data(), done.size());
+                sink.done();
+                return true;
+            });
+    });
+
+    // ATK patch: POST /tokenize, as llama-server has it -- {"content": str, "add_special": bool,
+    // "parse_special": bool} -> {"tokens": [...]}. Lets a client budget its context exactly.
+    http.Post("/tokenize", [&srv](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception & e) { res.status = 400; res.set_content(error_json(std::string("invalid JSON: ") + e.what(), "invalid_request_error", 400).dump(), "application/json"); return; }
+        const std::string content = body.value("content", std::string());
+        const bool add_special   = body.value("add_special", false);
+        const bool parse_special = body.value("parse_special", true);
+        const std::vector<llama_token> toks = common_tokenize(srv.vocab, content, add_special, parse_special);
+        res.set_content(json{{"tokens", toks}}.dump(), "application/json");
     });
 
     SRV_INF("server is listening on http://%s:%d\n", hostname.c_str(), port);

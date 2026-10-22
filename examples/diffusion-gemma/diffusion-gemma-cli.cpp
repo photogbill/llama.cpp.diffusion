@@ -179,6 +179,10 @@ int main(int argc, char ** argv) {
     model_params.use_mmap     = params.use_mmap;
     model_params.use_extra_bufts = !params.no_extra_bufts;
     model_params.no_host         = params.no_host;
+    // ATK patch: hand -ot / --cpu-moe / --n-cpu-moe to the loader (parsed, but never passed before).
+    model_params.tensor_buft_overrides =
+        (params.tensor_buft_overrides.empty() || params.tensor_buft_overrides.front().pattern == nullptr)
+            ? nullptr : params.tensor_buft_overrides.data();
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
     if (!model) {
@@ -269,6 +273,7 @@ int main(int argc, char ** argv) {
     ctx_params.n_batch  = n_ub;
     ctx_params.n_ubatch = n_ub;
     ctx_params.no_perf  = params.no_perf;
+    ctx_params.op_offload = !params.no_op_offload;   // ATK patch: honour --no-op-offload
     ctx_params.diffusion_self_cond_top_k = SC_K;
     ctx_params.diffusion_input_gpu_groups = params.diffusion.input_gpu_groups;
     ctx_params.diffusion_fused_self_cond_embd = params.diffusion.fused_self_cond_embd;
