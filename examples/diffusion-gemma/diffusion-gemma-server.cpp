@@ -146,6 +146,37 @@ struct diffusion_request {
     bool                     readout      = false;
     // ATK patch 2: keep the KV of the longest prompt prefix shared with the previous request.
     bool                     cache_prompt = true;
+
+    // ATK patch 3: per-position noise for the laid-out canvas ("atk_canvas.noise_map"), overriding
+    // `canvas_noise` where given, so a client can re-noise exactly the spans a verifier rejected
+    // and leave the rest as the model's own draft; and where on the schedule to start
+    // ("atk_canvas.start", 0..1). Without `start` the schedule starts at the MEAN noise of the
+    // given, unheld positions (blank positions count as 1.0).
+    std::vector<float>       canvas_noise_map;
+    float                    canvas_start = -1.0f;
+    // ATK patch 3: warm noise ("atk_sampler.warm_start" / "warm_end"). A position not accepted
+    // this step is re-randomised; with probability rho it keeps the model's own sample for that
+    // position instead of a uniform random token. rho runs linearly from warm_start at the first
+    // step to warm_end at the last. 0/0 (the default) is the PR's behaviour exactly.
+    float    warm_start = 0.0f;
+    float    warm_end   = 0.0f;
+    // ATK patch 3: plateau re-noise ("atk_sampler.plateau_*"). When the mean entropy has not
+    // fallen by plateau_eps for plateau_steps consecutive steps, and the stop test has not
+    // passed, the plateau_frac highest-entropy unheld positions and their neighbours are forced
+    // out of the accepted set (uniform noise, not warm) and plateau_extra steps are added to the
+    // schedule, at most plateau_max times per canvas. plateau_steps 0 (the default) = off.
+    int      plateau_steps = 0;
+    float    plateau_eps   = 0.002f;
+    float    plateau_frac  = 0.2f;
+    int      plateau_extra = 8;
+    int      plateau_max   = 2;
+    // ATK patch 3: keep the lowest-mean-entropy canvas seen and return it when the last step's
+    // canvas is worse ("atk_sampler.keep_best", default on). Off = the PR's behaviour.
+    bool     keep_best     = true;
+    // ATK patch 3: refuse a control token (other than end-of-generation) sampled into a canvas
+    // position ("atk_sampler.no_control"): it is never accepted, so the position is re-noised.
+    // Off by default; the readout ALWAYS reports how many control tokens the canvas holds.
+    bool     no_control    = false;
 };
 
 struct diffusion_result {
@@ -176,6 +207,24 @@ struct diffusion_result {
     std::vector<int>         canvas0_flips;
     int                      canvas0_steps = 0;
     int                      canvas0_start = 0;
+    // ATK patch 3: the first canvas's trajectory, one row per denoising step
+    struct step_stat {
+        int    step;          // 1-based, counting up
+        int    cur_step;      // the schedule position (counts down; rises when a plateau adds steps)
+        float  mean_entropy;  // over free (unheld) positions, before acceptance
+        int    accepted;      // positions accepted this step
+        int    flips;         // positions whose argmax changed since the previous step
+        int    control;       // positions whose sample was a control token (not EOG)
+        float  temp;
+        double ms;
+        bool   plateau;       // this step fired a plateau re-noise
+    };
+    std::vector<step_stat>   canvas0_trajectory;
+    int                      canvas0_plateaus     = 0;
+    bool                     canvas0_from_best    = false; // the returned canvas is the best seen, not the last
+    float                    canvas0_best_entropy = 0.0f;
+    float                    canvas0_last_entropy = 0.0f;
+    int                      canvas0_control      = 0;     // control tokens (not EOG) in the returned canvas
 };
 
 // ATK patch: called from inside generate(). on_step runs before every denoising step and
@@ -295,7 +344,7 @@ struct diffusion_server {
     common_params_diffusion diffusion;
     std::string model_id;
     std::string model_path;
-    std::string build_info = "llama.cpp diffusion-gemma-server (PR #24427) + ATK patch 2";
+    std::string build_info = "llama.cpp diffusion-gemma-server (PR #24427) + ATK patch 3";
 
     server_metrics metrics;
     std::mutex gen_mutex;            // serialize generation (ctx is single-threaded == one slot)
@@ -456,11 +505,27 @@ struct diffusion_server {
                         canvas[i] = t;
                     } else {
                         ++n_free;
-                        if (t >= 0 && t < n_vocab && rand_unif(rng) >= rq.canvas_noise) canvas[i] = t;
+                        const float noise_i = (i < rq.canvas_noise_map.size()) ? rq.canvas_noise_map[i] : rq.canvas_noise;
+                        if (t >= 0 && t < n_vocab && rand_unif(rng) >= noise_i) canvas[i] = t;
                     }
                 }
                 n_free += canvas_length - (int) rq.canvas_init.size();
-                const float noise = std::min(std::max(rq.canvas_noise, 0.0f), 1.0f);
+                float noise = std::min(std::max(rq.canvas_noise, 0.0f), 1.0f);
+                if (rq.canvas_start >= 0.0f) {
+                    noise = rq.canvas_start;
+                } else if (!rq.canvas_noise_map.empty()) {
+                    // ATK patch 3: the schedule starts at the mean noise of the given, unheld
+                    // positions; positions past the given tokens are pure noise and count as 1.0.
+                    double sum = 0.0; int n = 0;
+                    for (size_t i = 0; i < rq.canvas_init.size(); ++i) {
+                        if (rq.canvas_hold[i] || rq.canvas_init[i] < 0) continue;
+                        sum += (i < rq.canvas_noise_map.size()) ? rq.canvas_noise_map[i] : rq.canvas_noise;
+                        ++n;
+                    }
+                    const int n_blank = canvas_length - (int) rq.canvas_init.size();
+                    if (n + n_blank > 0) noise = (float) ((sum + (double) n_blank) / (double) (n + n_blank));
+                }
+                noise = std::min(std::max(noise, 0.0f), 1.0f);
                 start_step = std::max(1, std::min(n_steps, (int) lroundf(noise * (float) n_steps)));
             }
             if (watch) {
@@ -468,6 +533,14 @@ struct diffusion_server {
                 entropy0.assign(canvas_length, 0.0f);
                 out.canvas0_start = start_step;
             }
+            // ATK patch 3: best-canvas retention and plateau re-noise, per canvas
+            float                    best_mean = INFINITY;
+            std::vector<llama_token> best_argmax;
+            std::vector<float>       best_entropy;
+            float                    prev_mean = INFINITY;
+            int                      stall     = 0;
+            int                      plateaus  = 0;
+            int                      step_no   = 0;
             auto is_held = [&](int i) {
                 return laid && i < (int) rq.canvas_hold.size() && rq.canvas_hold[i];
             };
@@ -481,6 +554,8 @@ struct diffusion_server {
                 }
                 ++n_steps_total;
                 if (watch) ++out.canvas0_steps;
+                ++step_no;
+                const auto t_step0 = std::chrono::steady_clock::now();
                 const float temp = rq.temp_min + (rq.temp_max - rq.temp_min) * ((float) cur_step / (float) n_steps);
 
                 int k_step = 0;
@@ -712,11 +787,26 @@ struct diffusion_server {
                         ent_sum += entropy[i];
                     }
                 }
+                int flips_step = 0;
                 if (watch) {
                     for (int i = 0; i < canvas_length; ++i) {
-                        if (prev_argmax[i] >= 0 && prev_argmax[i] != argmax_canvas[i]) ++flips0[i];
+                        if (prev_argmax[i] >= 0 && prev_argmax[i] != argmax_canvas[i]) { ++flips0[i]; ++flips_step; }
                     }
                     entropy0 = entropy;
+                }
+
+                // ATK patch 3: a control token (other than end-of-generation) sampled into a text
+                // position is counted always, and refused when the request asks for it. This is
+                // the diagnostic for the eaten-character defect: a control token renders as an
+                // EMPTY piece, so the text on either side of it is glued together.
+                std::vector<char> ctrl_sampled(canvas_length, 0);
+                int n_ctrl = 0;
+                for (int i = 0; i < canvas_length; ++i) {
+                    if (is_held(i)) continue;
+                    const llama_token t = sampled[i];
+                    if (t >= 0 && t < n_vocab && llama_vocab_is_control(vocab, t) && !llama_vocab_is_eog(vocab, t)) {
+                        ctrl_sampled[i] = 1; ++n_ctrl;
+                    }
                 }
 
                 std::vector<int> order(canvas_length);
@@ -725,14 +815,56 @@ struct diffusion_server {
                 std::vector<char> accept_mask(canvas_length, 0);
                 float prefix = 0.0f;
                 for (int k = 0; k < canvas_length; ++k) {
-                    if (prefix <= rq.entropy_bound) { accept_mask[order[k]] = 1; prefix += entropy[order[k]]; }
-                    else break;
+                    if (prefix > rq.entropy_bound) break;
+                    if (rq.no_control && ctrl_sampled[order[k]]) continue;   // ATK patch 3
+                    accept_mask[order[k]] = 1; prefix += entropy[order[k]];
                 }
                 for (int i = 0; i < canvas_length; ++i) if (accept_mask[i]) accepted[i] = sampled[i];
 
                 const float mean_ent = ent_sum / (float) std::max(1, n_free);
                 const bool stable    = (STABILITY_THRESHOLD == 0) || (argmax_canvas == prev_argmax);
                 const bool confident = mean_ent < rq.stop_entropy;
+
+                // ATK patch 3: remember the best canvas seen (lowest mean entropy over free positions)
+                if (watch && mean_ent < best_mean) {
+                    best_mean    = mean_ent;
+                    best_argmax  = argmax_canvas;
+                    best_entropy = entropy;
+                }
+
+                // ATK patch 3: plateau re-noise. Runs only when the stop test has NOT passed.
+                bool plateau_fired = false;
+                std::vector<char> demolished;
+                if (!(stable && confident) && rq.plateau_steps > 0 && plateaus < rq.plateau_max) {
+                    if (prev_mean - mean_ent < rq.plateau_eps) ++stall; else stall = 0;
+                    if (stall >= rq.plateau_steps) {
+                        demolished.assign(canvas_length, 0);
+                        const int n_demo = std::max(1, (int) lroundf(rq.plateau_frac * (float) std::max(1, n_free)));
+                        int c = 0;
+                        for (int k = canvas_length - 1; k >= 0 && c < n_demo; --k) {   // order[] is ascending: the end is the noisiest
+                            const int pidx = order[k];
+                            if (is_held(pidx)) continue;
+                            demolished[pidx] = 1; ++c;
+                            if (pidx > 0 && !is_held(pidx - 1)) demolished[pidx - 1] = 1;
+                            if (pidx + 1 < canvas_length && !is_held(pidx + 1)) demolished[pidx + 1] = 1;
+                        }
+                        for (int i = 0; i < canvas_length; ++i) if (demolished[i]) accept_mask[i] = 0;
+                        cur_step = std::min(start_step, cur_step + rq.plateau_extra);
+                        stall = 0; ++plateaus; plateau_fired = true;
+                    }
+                }
+                prev_mean = mean_ent;
+
+                if (watch) {
+                    int n_acc = 0;
+                    for (int i = 0; i < canvas_length; ++i) n_acc += accept_mask[i] ? 1 : 0;
+                    diffusion_result::step_stat st;
+                    st.step = step_no; st.cur_step = cur_step; st.mean_entropy = mean_ent; st.accepted = n_acc;
+                    st.flips = flips_step; st.control = n_ctrl; st.temp = temp; st.plateau = plateau_fired;
+                    st.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_step0).count();
+                    out.canvas0_trajectory.push_back(st);
+                }
+
                 if (stable && confident) break;
                 prev_argmax = argmax_canvas;
 
@@ -740,16 +872,48 @@ struct diffusion_server {
                     llama_set_diffusion_self_cond_topk(ctx, sc_ids.data(), sc_probs.data(), SC_K, canvas_length);
                 }
 
-                for (int i = 0; i < canvas_length; ++i) canvas[i] = accept_mask[i] ? accepted[i] : rand_tok(rng);
+                // ATK patch 3: warm noise. A rejected position keeps the model's own sample with
+                // probability rho instead of a uniform random token (never a control token, and
+                // never for a position a plateau just demolished — those get pure noise, which
+                // is the point of demolishing them). rho runs warm_start -> warm_end over the
+                // schedule; progress is 0 at start_step and 1 at the last step.
+                const float progress = (start_step > 1) ? (float) (start_step - cur_step) / (float) (start_step - 1) : 1.0f;
+                const float rho = std::min(std::max(rq.warm_start + (rq.warm_end - rq.warm_start) * progress, 0.0f), 1.0f);
+                for (int i = 0; i < canvas_length; ++i) {
+                    if (accept_mask[i]) { canvas[i] = accepted[i]; continue; }
+                    const bool demo = !demolished.empty() && demolished[i];
+                    if (rho > 0.0f && !demo && !ctrl_sampled[i] && rand_unif(rng) < rho) canvas[i] = sampled[i];
+                    else canvas[i] = rand_tok(rng);
+                }
                 for (int i = 0; laid && i < (int) rq.canvas_hold.size(); ++i) {
                     if (rq.canvas_hold[i]) canvas[i] = rq.canvas_init[i];
                 }
             }
             if (watch) {
+                // ATK patch 3: the last step's mean entropy, and the swap to the best canvas when
+                // the last is worse. The swap is made in argmax_canvas ITSELF (element copy, not
+                // reassignment: the vector is pinned host memory) so that the readout, the text
+                // in choices and the canvas committed to the KV all agree.
+                float last_sum = 0.0f;
+                for (int i = 0; i < canvas_length; ++i) if (!is_held(i)) last_sum += entropy0[i];
+                const float last_mean = last_sum / (float) std::max(1, n_free);
+                out.canvas0_last_entropy = last_mean;
+                out.canvas0_best_entropy = (best_mean < INFINITY) ? best_mean : last_mean;
+                out.canvas0_plateaus     = plateaus;
+                if (rq.keep_best && !best_argmax.empty() && best_mean < last_mean - 1e-6f) {
+                    std::copy(best_argmax.begin(), best_argmax.end(), argmax_canvas.begin());
+                    entropy0 = best_entropy;
+                    out.canvas0_from_best = true;
+                }
                 out.has_readout     = true;
                 out.canvas0         = argmax_canvas;
                 out.canvas0_entropy = entropy0;
                 out.canvas0_flips   = flips0;
+                int n_ctrl_out = 0;
+                for (const llama_token t : argmax_canvas) {
+                    if (t >= 0 && t < n_vocab && llama_vocab_is_control(vocab, t) && !llama_vocab_is_eog(vocab, t)) ++n_ctrl_out;
+                }
+                out.canvas0_control = n_ctrl_out;
             }
 
             const std::vector<llama_token> & block_out = argmax_canvas;
@@ -920,6 +1084,19 @@ static diffusion_request request_from_body(const json & body, const diffusion_se
         num("stop_entropy",  rq.stop_entropy,  0.0f, 1000.0f);
         num("temp_max",      rq.temp_max,      0.01f, 10.0f);
         num("temp_min",      rq.temp_min,      0.01f, 10.0f);
+        // ATK patch 3
+        num("warm_start",    rq.warm_start,    0.0f, 1.0f);
+        num("warm_end",      rq.warm_end,      0.0f, 1.0f);
+        num("plateau_eps",   rq.plateau_eps,   0.0f, 10.0f);
+        num("plateau_frac",  rq.plateau_frac,  0.0f, 1.0f);
+        auto integer = [&](const char * k, int & dst, int lo, int hi) {
+            if (sm.contains(k) && sm[k].is_number_integer()) dst = std::min(std::max((int) sm[k].get<int64_t>(), lo), hi);
+        };
+        integer("plateau_steps", rq.plateau_steps, 0, 1000);
+        integer("plateau_extra", rq.plateau_extra, 0, 1000);
+        integer("plateau_max",   rq.plateau_max,   0, 100);
+        if (sm.contains("keep_best")  && sm["keep_best"].is_boolean())  rq.keep_best  = sm["keep_best"].get<bool>();
+        if (sm.contains("no_control") && sm["no_control"].is_boolean()) rq.no_control = sm["no_control"].get<bool>();
     }
     if (body.contains("atk_canvas") && body["atk_canvas"].is_object()) {
         const json & cv = body["atk_canvas"];
@@ -933,6 +1110,13 @@ static diffusion_request request_from_body(const json & body, const diffusion_se
             rq.canvas_hold.assign(rq.canvas_init.size(), 0);
         }
         if (cv.contains("noise") && cv["noise"].is_number()) rq.canvas_noise = std::min(std::max(cv["noise"].get<float>(), 0.0f), 1.0f);
+        // ATK patch 3
+        if (cv.contains("noise_map") && cv["noise_map"].is_array()) {
+            for (const auto & v : cv["noise_map"]) {
+                rq.canvas_noise_map.push_back(v.is_number() ? std::min(std::max(v.get<float>(), 0.0f), 1.0f) : rq.canvas_noise);
+            }
+        }
+        if (cv.contains("start") && cv["start"].is_number()) rq.canvas_start = std::min(std::max(cv["start"].get<float>(), 0.0f), 1.0f);
     }
     if (body.contains("atk_readout") && body["atk_readout"].is_boolean()) rq.readout = body["atk_readout"].get<bool>();
     if (body.contains("atk_cache_prompt") && body["atk_cache_prompt"].is_boolean()) rq.cache_prompt = body["atk_cache_prompt"].get<bool>();
@@ -953,11 +1137,63 @@ static json readout_json(const diffusion_server & srv, const diffusion_result & 
         pieces.push_back(hex);
         eog.push_back(llama_vocab_is_eog(srv.vocab, t));
     }
-    return json{
+    // ATK patch 3: the canvas as ONE detokenized string, with each position's byte offset into
+    // it, so a client never has to join pieces itself; which positions hold a control token
+    // (rendered empty in `text`, so the text either side of one is glued together); and the
+    // per-step trajectory. `offsets` has canvas_length + 1 entries: the last is text.size().
+    std::vector<llama_token> prefix;
+    prefix.reserve(r.canvas0.size());
+    json offsets = json::array(), control = json::array();
+    for (const llama_token t : r.canvas0) {
+        offsets.push_back((int64_t) common_detokenize(srv.vocab, prefix, false).size());
+        prefix.push_back(t);
+        control.push_back(llama_vocab_is_control(srv.vocab, t) && !llama_vocab_is_eog(srv.vocab, t));
+    }
+    const std::string text = common_detokenize(srv.vocab, prefix, false);
+    offsets.push_back((int64_t) text.size());
+    json traj = json::array();
+    for (const auto & st : r.canvas0_trajectory) {
+        traj.push_back(json{
+            {"step", st.step}, {"cur_step", st.cur_step}, {"mean_entropy", st.mean_entropy},
+            {"accepted", st.accepted}, {"flips", st.flips}, {"control", st.control},
+            {"temp", st.temp}, {"ms", st.ms}, {"plateau", st.plateau},
+        });
+    }
+    // Bytes that are not valid UTF-8 (a canvas can end inside a multi-byte character) must not
+    // reach json::dump(), which would throw; such a string goes out as hex instead, flagged.
+    bool text_utf8 = true;
+    {
+        const unsigned char * b = (const unsigned char *) text.data();
+        size_t i = 0, n = text.size();
+        while (i < n && text_utf8) {
+            int len = 1;
+            if      (b[i] < 0x80) len = 1;
+            else if ((b[i] & 0xE0) == 0xC0) len = 2;
+            else if ((b[i] & 0xF0) == 0xE0) len = 3;
+            else if ((b[i] & 0xF8) == 0xF0) len = 4;
+            else { text_utf8 = false; break; }
+            if (i + len > n) { text_utf8 = false; break; }
+            for (int k = 1; k < len; ++k) if ((b[i + k] & 0xC0) != 0x80) { text_utf8 = false; break; }
+            i += len;
+        }
+    }
+    std::string text_hex;
+    if (!text_utf8) {
+        text_hex.reserve(text.size() * 2);
+        for (const unsigned char c : text) { text_hex.push_back(HEX[c >> 4]); text_hex.push_back(HEX[c & 15]); }
+    }
+    json out = json{
         {"tokens", r.canvas0}, {"pieces_hex", pieces}, {"eog", eog},
         {"entropy", r.canvas0_entropy}, {"flips", r.canvas0_flips},
         {"steps", r.canvas0_steps}, {"start_step", r.canvas0_start},
+        // ATK patch 3
+        {"offsets", offsets}, {"control", control}, {"control_count", r.canvas0_control},
+        {"trajectory", traj}, {"plateaus", r.canvas0_plateaus},
+        {"from_best", r.canvas0_from_best},
+        {"best_entropy", r.canvas0_best_entropy}, {"last_entropy", r.canvas0_last_entropy},
     };
+    if (text_utf8) out["text"] = text; else out["text_hex"] = text_hex;
+    return out;
 }
 
 // ------------------------------------------------------------------------------------------------
