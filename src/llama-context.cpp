@@ -1226,6 +1226,59 @@ void llama_context::set_diffusion_self_cond_topk(const int32_t * ids, const floa
     diffusion_cond.sc_topk_probs.assign(probs, probs + n);
 }
 
+// ATK patch 4: zero the self-conditioning of selected canvas positions, wherever it lives.
+//   host  : the top-k probs rows the next set_input() uploads (ids are left; zero probs gather nothing)
+//   device: the sparse top-k probs rows, or the fused soft-embedding columns, written in place with
+//           ggml_backend_tensor_set (synchronous on the backend; the sampling kernel that wrote the
+//           tensor has already completed by the time its host outputs were read)
+// Both input tensors are position-major ({k | n_embd, n_tokens}), so one position is one
+// contiguous nb[1]-byte row.
+int32_t llama_context::diffusion_self_cond_clear(const int32_t * positions, int32_t n_positions) {
+    if (!positions || n_positions <= 0) {
+        return 0;
+    }
+    auto clear_rows = [&](ggml_tensor * t, const void * expect_data, size_t expect_bytes) -> int32_t {
+        if (!t || !t->data || t->data != expect_data || ggml_nbytes(t) != expect_bytes || t->ne[1] <= 0) {
+            return -1;
+        }
+        const size_t row_bytes = t->nb[1];
+        std::vector<uint8_t> zeros(row_bytes, 0);
+        int32_t n = 0;
+        for (int32_t i = 0; i < n_positions; ++i) {
+            const int32_t p = positions[i];
+            if (p < 0 || p >= (int32_t) t->ne[1]) {
+                continue;
+            }
+            ggml_backend_tensor_set(t, zeros.data(), (size_t) p * row_bytes, row_bytes);
+            ++n;
+        }
+        return n;
+    };
+    if (diffusion_cond.sc_embd_device_ready && gf_res_prev) {
+        auto * inp = gf_res_prev->get_inp_diffusion_self_cond_embd();
+        return clear_rows(inp ? inp->embd : nullptr, diffusion_cond.sc_embd_device_data, diffusion_cond.sc_embd_device_bytes);
+    }
+    if (diffusion_cond.sc_topk_device_ready && gf_res_prev) {
+        auto * inp = gf_res_prev->get_inp_diffusion_self_cond_topk();
+        return clear_rows(inp ? inp->probs : nullptr, diffusion_cond.sc_topk_device_probs_data, diffusion_cond.sc_topk_device_probs_bytes);
+    }
+    if (diffusion_cond.sc_topk > 0 && !diffusion_cond.sc_topk_probs.empty()) {
+        const size_t k = (size_t) diffusion_cond.sc_topk;
+        const size_t n_tokens = diffusion_cond.sc_topk_probs.size() / k;
+        int32_t n = 0;
+        for (int32_t i = 0; i < n_positions; ++i) {
+            const int32_t p = positions[i];
+            if (p < 0 || (size_t) p >= n_tokens) {
+                continue;
+            }
+            std::fill_n(diffusion_cond.sc_topk_probs.begin() + (size_t) p * k, k, 0.0f);
+            ++n;
+        }
+        return n;
+    }
+    return -1;
+}
+
 static ggml_backend_cuda_diffusion_sample_topk_t get_cuda_diffusion_sample_topk_proc(ggml_backend_t backend) {
     if (!backend) {
         return nullptr;
@@ -3943,6 +3996,10 @@ void llama_set_diffusion_decoder_phase(llama_context * ctx, bool decoder_phase) 
 
 void llama_set_diffusion_self_cond_topk(llama_context * ctx, const int32_t * ids, const float * probs, int64_t k, int64_t n_tokens) {
     ctx->set_diffusion_self_cond_topk(ids, probs, k, n_tokens);
+}
+
+int32_t llama_diffusion_self_cond_clear(llama_context * ctx, const int32_t * positions, int32_t n_positions) {
+    return ctx->diffusion_self_cond_clear(positions, n_positions);
 }
 
 bool llama_diffusion_sample_topk_supported(llama_context * ctx) {

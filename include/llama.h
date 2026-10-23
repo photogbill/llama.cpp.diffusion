@@ -1021,6 +1021,18 @@ extern "C" {
                          int64_t   k,
                          int64_t   n_tokens);
 
+    // ATK patch 4: forget the self-conditioning of the given canvas positions. The next decode
+    // sees no memory for them (the zero input of a first step) while every other position keeps
+    // its own. Works on state held on the host (llama_set_diffusion_self_cond_topk) and on state
+    // the CUDA fast path wrote on the device (the sparse top-k tensors, or the fused soft
+    // embedding), through the generic backend tensor API. Call it after the step's sampling has
+    // completed and before the next llama_decode(). Returns the number of positions cleared,
+    // or -1 when no self-conditioning state is live (nothing to forget).
+    LLAMA_API int32_t llama_diffusion_self_cond_clear(
+            struct llama_context * ctx,
+                   const int32_t * positions,
+                         int32_t   n_positions);
+
     struct llama_diffusion_sample_params {
         int32_t  n_tokens;
         int32_t  top_k;

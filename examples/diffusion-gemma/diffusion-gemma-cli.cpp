@@ -170,19 +170,15 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
 
-    llama_model_params model_params = llama_model_default_params();
+    // ATK patch 4: loader params from common's converter, so every parsed flag reaches the loader
+    // (-ot / --cpu-moe / --n-cpu-moe, --override-kv, --mlock, --no-mmap, -sm / -ts / -mg, ...).
     // Offload all layers to the GPU by default (when built with a GPU backend, e.g.
     // -DGGML_CUDA=ON). Pass -ngl N to limit offload, or -ngl 0 to force CPU. With a
     // CPU-only build this has no effect. (params.n_gpu_layers defaults to -1 = auto.)
-    model_params.n_gpu_layers = params.n_gpu_layers >= 0 ? params.n_gpu_layers : 999;
-    model_params.devices      = params.devices.data();
-    model_params.use_mmap     = params.use_mmap;
-    model_params.use_extra_bufts = !params.no_extra_bufts;
-    model_params.no_host         = params.no_host;
-    // ATK patch: hand -ot / --cpu-moe / --n-cpu-moe to the loader (parsed, but never passed before).
-    model_params.tensor_buft_overrides =
-        (params.tensor_buft_overrides.empty() || params.tensor_buft_overrides.front().pattern == nullptr)
-            ? nullptr : params.tensor_buft_overrides.data();
+    llama_model_params model_params = common_model_params_to_llama(params);
+    if (params.n_gpu_layers < 0) {
+        model_params.n_gpu_layers = 999;
+    }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
     if (!model) {
@@ -268,12 +264,14 @@ int main(int argc, char ** argv) {
     // Largest single decode is the prompt prefill (prefix_len) or a canvas pass (canvas_length).
     const int n_ub      = std::max(std::max(prefix_len, canvas_length), 1);
 
-    llama_context_params ctx_params = llama_context_default_params();
+    // ATK patch 4: context params from common's converter (-fa, -ctk / -ctv, --no-kv-offload, -t,
+    // --no-op-offload ...), then pinned: the batch is the canvas, and the SWA cache is full-size
+    // (the per-step canvas rollback with llama_memory_seq_rm is exact only on a full-size cache).
+    llama_context_params ctx_params = common_context_params_to_llama(params);
     ctx_params.n_ctx    = n_ctx;
     ctx_params.n_batch  = n_ub;
     ctx_params.n_ubatch = n_ub;
-    ctx_params.no_perf  = params.no_perf;
-    ctx_params.op_offload = !params.no_op_offload;   // ATK patch: honour --no-op-offload
+    ctx_params.swa_full = true;
     ctx_params.diffusion_self_cond_top_k = SC_K;
     ctx_params.diffusion_input_gpu_groups = params.diffusion.input_gpu_groups;
     ctx_params.diffusion_fused_self_cond_embd = params.diffusion.fused_self_cond_embd;

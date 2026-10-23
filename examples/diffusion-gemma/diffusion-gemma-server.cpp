@@ -27,6 +27,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <unordered_map>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -177,6 +179,124 @@ struct diffusion_request {
     // position ("atk_sampler.no_control"): it is never accepted, so the position is re-noised.
     // Off by default; the readout ALWAYS reports how many control tokens the canvas holds.
     bool     no_control    = false;
+
+    // ---- ATK patch 4 ---------------------------------------------------------------------------
+    // Every field below is opt-in; the defaults reproduce patch 3 exactly, except demolish_clear_sc
+    // (a fix to patch 3's plateau re-noise, see below). "host self-cond" marks features that read or
+    // edit the per-position top-k distribution on the host: they need the server launched with
+    // --no-diffusion-device-selfcond (reported as "host_self_cond" in /props); a request that asks
+    // for one on a device-self-cond server is refused with a message naming the flag.
+
+    // "atk_canvas.length": a shorter canvas for this request (<= the server's canvas, which is the
+    // model's trained length: 256). The step cost is linear in canvas tokens, so this is the one
+    // knob that cuts the per-step floor for short answers -- but the model never saw a shorter
+    // block in training, so it is an EXPERIMENT: bench it before relying on it. 0 = server's.
+    int      canvas_len_req = 0;
+    // "atk_sampler.stability_steps": the argmax must be unchanged for this many consecutive steps
+    // (over the positions the stop test watches) for the stop test to pass. The PR uses 1.
+    int      stability_steps = 1;
+    // "atk_sampler.eog_tail": once an end-of-generation token has been the argmax at the same
+    // position for eog_tail_stable steps, the positions AFTER it are the tail of a finished
+    // answer. They leave the stop test (mean entropy and stability) and the plateau's demolition
+    // set, so a flickering position in the tail no longer keeps a 12-token answer running for
+    // the full schedule. eog_tail_pad additionally writes the pad token into the tail each step
+    // (a model-INPUT change: the model then sees a padded block, as a finished SFT block looks).
+    bool     eog_tail        = false;
+    int      eog_tail_stable = 2;
+    bool     eog_tail_pad    = false;
+    // "atk_sampler.noise_text": re-noise draws from TEXT tokens only (NORMAL / USER_DEFINED / BYTE
+    // attributes), not from the control and <unused...> ids that make up a few percent of a Gemma
+    // vocabulary. The PR (and the device loop) draw uniformly over all 262,144 ids.
+    bool     noise_text      = false;
+    // "atk_sampler.noise_clear_sc": a re-noised position also forgets its self-conditioning (the
+    // model gets no memory of what it thought there). Off = the PR's behaviour: noise in the
+    // token, memory intact. "demolish_clear_sc" (default ON) does the same for the positions a
+    // plateau demolishes -- patch 3 gave them pure noise but left their memory in place, so the
+    // model was still told what it had thought there; this completes the demolition.
+    bool     noise_clear_sc    = false;
+    bool     demolish_clear_sc = true;
+    // "atk_sampler.sprint_*": the mirror of the plateau. When the mean entropy is already below
+    // sprint_below, skip sprint_jump schedule steps (cool faster: only the temperature and the
+    // top-k anneal depend on the schedule position), never below cur_step = sprint_min.
+    float    sprint_below = 0.0f;   // 0 = off
+    int      sprint_jump  = 2;
+    int      sprint_min   = 2;
+    // "atk_sampler.pos_bias": acceptance ORDER key = entropy * (1 + pos_bias * i / L). Positive
+    // commits the left of the canvas first (a mild left-to-right prior); the entropy BUDGET is
+    // still summed from the raw entropies. 0 = the PR's pure entropy order.
+    float    pos_bias = 0.0f;
+    // "atk_sampler.accept_order": "entropy" (the PR) or "margin" -- order by the top-1/top-2
+    // probability margin instead (host self-cond). Margin is often the better-calibrated
+    // confidence for a discrete choice; the budget still sums entropy.
+    std::string accept_order = "entropy";
+    // "atk_sampler.bound_end": schedule the entropy budget from entropy_bound at the first step to
+    // bound_end at the last (linear in schedule progress). < 0 = constant (the PR).
+    float    bound_end = -1.0f;
+    // "atk_sampler.temp_pos_gain": per-position temperature (host self-cond). Position i's top-k
+    // distribution is re-tempered by T_i = T * (1 + g * z_i), z_i in [-1, 1] the entropy RANK of
+    // the position (noisiest = +1): uncertain positions explore, confident ones commit. 0 = off.
+    float    temp_pos_gain = 0.0f;
+    // "atk_sampler.rep_*": spatial repetition penalty (host self-cond; plan item 6). Before
+    // sampling position i, p_i(v) *= exp(-eta * sum_j w(|i-j|) * p_j(v)) over the +-rep_window
+    // neighbours, w(d) = exp(-(d-1)/rep_decay), for tokens whose text has >= rep_min_chars
+    // characters including a letter or digit (so punctuation, spaces and short pieces are never
+    // penalised). The argmax canvas and the fed-back distribution take the penalty too.
+    float    rep_penalty   = 0.0f;  // eta; 0 = off
+    int      rep_window    = 8;
+    float    rep_decay     = 4.0f;
+    int      rep_min_chars = 3;
+    // "atk_sampler.sc_sharpen": exponent on the fed-back distribution (host self-cond): p^gamma,
+    // renormalised. > 1 sharpens (more commitment), < 1 softens (more exploration). 1 = the PR.
+    float    sc_sharpen = 1.0f;
+    // "atk_sampler.lateral_noise": a re-noised position draws its new token from a NEIGHBOUR's
+    // top-k distribution with this probability (host self-cond) -- noise that is locally
+    // plausible instead of uniform. Tried before warm noise. 0 = off.
+    float    lateral_noise = 0.0f;
+    // "atk_sampler.osc_*": oscillation hold (the cheap form of plan item 5, stall bifurcation).
+    // A position whose argmax alternates A,B,A,B for osc_steps steps is oscillating; when 1 ..
+    // osc_max_pos positions oscillate and the stop test has not passed, each is held for
+    // osc_hold_steps steps at whichever of its two states had the lower entropy, then released.
+    int      osc_steps      = 0;    // 0 = off
+    int      osc_max_pos    = 4;
+    int      osc_hold_steps = 3;
+    // "atk_sampler.n_candidates": best-of-N. The request is run N times with seeds seed, seed+1,
+    // ... (the prompt's KV is reused, so each costs its denoising steps only) and the canvas with
+    // the lowest mean entropy is returned; every candidate's answer is in "atk_candidates".
+    int      n_candidates = 1;
+    // "atk_readout_sc": return each position's top-N self-conditioning entries (host self-cond)
+    // in atk_canvas_out.self_cond, for the stateless verifier loop (see atk_canvas.self_cond).
+    int      sc_out_k = 0;
+    // "atk_canvas.self_cond": seed the FIRST step's self-conditioning from a previous readout
+    // (host self-cond). This is what makes "denoise -> verify -> re-noise the failed spans ->
+    // continue" a loop of stateless requests: the kept positions resume with their memory.
+    bool                 has_sc_seed = false;
+    int                  sc_seed_k   = 0;
+    std::vector<int32_t> sc_seed_ids;    // sc_seed_k per position, row-major over the given positions
+    std::vector<float>   sc_seed_probs;
+    // "atk_canvas.soft_hold": a position that starts as its given token with its self-conditioning
+    // seeded to that token at probability soft_hold_p (host self-cond) -- "prefer to keep this,
+    // but you may fix it". A hard hold fixes the token; a soft hold only remembers it.
+    std::vector<char>    soft_hold;
+    float                soft_hold_p = 0.9f;
+    // "atk_trajectory_text": each trajectory row also carries the argmax canvas as text.
+    // "atk_stream_steps" (stream=true only): an "atk_step" event per denoising step with the
+    // canvas text and entropy -- the denoising made visible.
+    bool     trajectory_text = false;
+    bool     stream_steps    = false;
+
+    // features that read or edit the top-k distribution on the host
+    bool needs_host_sc() const {
+        return accept_order == "margin" || temp_pos_gain != 0.0f || rep_penalty > 0.0f ||
+               sc_sharpen != 1.0f || lateral_noise > 0.0f || sc_out_k > 0 || has_sc_seed ||
+               std::find(soft_hold.begin(), soft_hold.end(), (char) 1) != soft_hold.end();
+    }
+    // features that need the host sampling path (per-step host bookkeeping) on EVERY block
+    bool needs_host_path() const {
+        return needs_host_sc() || warm_start > 0.0f || warm_end > 0.0f || plateau_steps > 0 ||
+               no_control || eog_tail || noise_text || noise_clear_sc || sprint_below > 0.0f ||
+               pos_bias != 0.0f || bound_end >= 0.0f || osc_steps > 0 || stability_steps != 1 ||
+               trajectory_text || stream_steps;
+    }
 };
 
 struct diffusion_result {
@@ -218,6 +338,13 @@ struct diffusion_result {
         float  temp;
         double ms;
         bool   plateau;       // this step fired a plateau re-noise
+        // ATK patch 4
+        bool   sprint    = false; // this step skipped ahead on the schedule
+        int    eog_pos   = -1;    // first position whose argmax is end-of-generation (-1: none)
+        int    tail      = 0;     // positions excluded from the stop test as the post-EOG tail
+        int    osc_holds = 0;     // positions under an oscillation hold after this step
+        float  bound     = 0.0f;  // the entropy budget used this step
+        std::string text;         // the argmax canvas as text (atk_trajectory_text)
     };
     std::vector<step_stat>   canvas0_trajectory;
     int                      canvas0_plateaus     = 0;
@@ -225,6 +352,18 @@ struct diffusion_result {
     float                    canvas0_best_entropy = 0.0f;
     float                    canvas0_last_entropy = 0.0f;
     int                      canvas0_control      = 0;     // control tokens (not EOG) in the returned canvas
+    // ATK patch 4
+    int                      canvas0_length    = 0;   // the canvas length this request ran with
+    int                      canvas0_sprints   = 0;
+    int                      canvas0_osc_holds = 0;   // oscillation-hold events
+    int                      canvas0_eog_pos   = -1;  // first EOG position in the returned canvas
+    int                      canvas0_tail_from = -1;  // first position the stop test stopped watching (-1: never)
+    int                      canvas0_sc_cleared = 0;  // self-conditioning rows forgotten (plateau / noise_clear_sc)
+    bool                     canvas0_host_sc   = false; // the request ran with host self-conditioning
+    int                      sc_out_k = 0;            // self-conditioning readout, top-N per position (last step)
+    std::vector<int32_t>     sc_out_ids;
+    std::vector<float>       sc_out_probs;
+    json                     candidates;              // best-of-N: one entry per candidate (empty otherwise)
 };
 
 // ATK patch: called from inside generate(). on_step runs before every denoising step and
@@ -233,6 +372,10 @@ struct diffusion_result {
 struct diffusion_hooks {
     std::function<bool(int block, int step, int n_steps)>               on_step;
     std::function<bool(int block, const std::vector<llama_token> & toks)> on_block;
+    // ATK patch 4: after every denoising step on the host path, the argmax canvas and the
+    // per-position entropy of that step (atk_stream_steps). Returning false stops the generation.
+    std::function<bool(int block, int step, const std::vector<llama_token> & argmax,
+                       const std::vector<float> & entropy, float mean_entropy, int accepted)> on_step_done;
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -344,7 +487,7 @@ struct diffusion_server {
     common_params_diffusion diffusion;
     std::string model_id;
     std::string model_path;
-    std::string build_info = "llama.cpp diffusion-gemma-server (PR #24427) + ATK patch 3";
+    std::string build_info = "llama.cpp diffusion-gemma-server (PR #24427) + ATK patch 4";
 
     server_metrics metrics;
     std::mutex gen_mutex;            // serialize generation (ctx is single-threaded == one slot)
@@ -352,6 +495,43 @@ struct diffusion_server {
     // ATK patch 2: what the KV cache holds, position by position (the last prompt plus the
     // canvases committed after it). Empty = nothing known, so the next request starts clean.
     std::vector<llama_token> kv_tokens;
+
+    // ATK patch 4: the server's self-conditioning lives on the host (--no-diffusion-device-selfcond)
+    bool host_self_cond = false;
+    // ATK patch 4: the text-token table for noise_text (NORMAL / USER_DEFINED / BYTE attributes)
+    std::vector<llama_token> noise_text_ids;
+    // ATK patch 4: the pad token for eog_tail_pad (LLAMA_TOKEN_NULL when the vocab has none)
+    llama_token pad_token = LLAMA_TOKEN_NULL;
+    // ATK patch 4: lazily computed per token: may the repetition penalty touch it? (-1 = unknown)
+    mutable std::vector<int8_t> rep_penalizable;
+
+    void init_atk_tables() {
+        noise_text_ids.clear();
+        noise_text_ids.reserve(n_vocab);
+        for (llama_token t = 0; t < n_vocab; ++t) {
+            const int attr = (int) llama_vocab_get_attr(vocab, t);
+            const bool text = (attr & (LLAMA_TOKEN_ATTR_NORMAL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_BYTE)) != 0;
+            if (text && !llama_vocab_is_control(vocab, t) && !llama_vocab_is_eog(vocab, t)) noise_text_ids.push_back(t);
+        }
+        pad_token = llama_vocab_pad(vocab);
+        rep_penalizable.assign(n_vocab, -1);
+    }
+
+    bool rep_may_penalize(llama_token t, int min_chars) const {
+        if (t < 0 || t >= n_vocab) return false;
+        if (rep_penalizable[t] >= 0) return rep_penalizable[t] == 1;
+        const std::string piece = common_token_to_piece(vocab, t, false);
+        int chars = 0; bool alnum = false;
+        for (const unsigned char c : piece) {
+            if (c == ' ' || c == '\n' || c == '\t' || c == '\r') continue;
+            if ((c & 0xC0) != 0x80) ++chars;            // count UTF-8 lead bytes, not continuation bytes
+            if (std::isalnum(c)) alnum = true;
+            if (c >= 0x80) alnum = true;                 // non-ASCII text counts as letters
+        }
+        const bool ok = alnum && chars >= min_chars && !llama_vocab_is_control(vocab, t);
+        rep_penalizable[t] = ok ? 1 : 0;
+        return ok;
+    }
 
     void invalidate_kv() {
         llama_memory_clear(mem, true);
@@ -398,10 +578,34 @@ struct diffusion_server {
         const int prefix_len = (int) prompt_tokens.size();
         int n_decode = 0;
 
+        // ATK patch 4: the canvas length this request runs with (<= the server's, which is one ubatch)
+        const int L = (rq.canvas_len_req > 0) ? rq.canvas_len_req : canvas_length;
+        if (L < 8 || L > canvas_length) {
+            out.error = "atk_canvas.length " + std::to_string(L) + " is outside 8.." + std::to_string(canvas_length) +
+                        " (the server's canvas is the upper bound)";
+            return out;
+        }
+        out.canvas0_length = L;
+        // ATK patch 4: features that read or edit the top-k distribution need host self-conditioning
+        if (rq.needs_host_sc() && !host_self_cond) {
+            out.error = "this request uses a host self-conditioning feature (accept_order=margin, temp_pos_gain, rep_penalty, "
+                        "sc_sharpen, lateral_noise, atk_readout_sc, atk_canvas.self_cond or soft_hold); launch the server with "
+                        "--no-diffusion-device-selfcond to enable them (see /props host_self_cond)";
+            return out;
+        }
+        if (rq.eog_tail_pad && pad_token == LLAMA_TOKEN_NULL) {
+            out.error = "atk_sampler.eog_tail_pad: this vocabulary has no pad token";
+            return out;
+        }
+        if (rq.noise_text && noise_text_ids.empty()) {
+            out.error = "atk_sampler.noise_text: no text tokens found in the vocabulary";
+            return out;
+        }
+
         int max_canvases = rq.max_canvases;
         const int n_steps = std::max(rq.n_steps, 1);
         const int SC_K = diffusion.self_cond_top_k;
-        const int fit = (n_ctx - prefix_len) / canvas_length - 1;
+        const int fit = (n_ctx - prefix_len) / L - 1;
         if (fit < 1) {
             out.error = "prompt too long for context (n_ctx=" + std::to_string(n_ctx) + ")";
             return out;
@@ -430,7 +634,12 @@ struct diffusion_server {
 
         std::mt19937 rng(rq.seed);
         std::uniform_int_distribution<int> rand_tok(0, n_vocab - 1);
+        std::uniform_int_distribution<int> rand_text(0, std::max(1, (int) noise_text_ids.size()) - 1);
         std::uniform_real_distribution<float> rand_unif(0.0f, 1.0f);
+        // ATK patch 4: one draw of noise -- uniform over the vocabulary (the PR) or over text tokens
+        auto draw_noise = [&]() -> llama_token {
+            return rq.noise_text ? noise_text_ids[rand_text(rng)] : rand_tok(rng);
+        };
 
         // ---- ENCODER phase: prefill the prompt prefix (causal, no self-conditioning) ----
         const auto t_prefill0 = std::chrono::steady_clock::now();
@@ -448,10 +657,10 @@ struct diffusion_server {
         out.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_prefill0).count();
 
         // ATK patch 2: the client's first canvas, checked before any denoising
-        if (rq.has_canvas && ((int) rq.canvas_init.size() > canvas_length ||
+        if (rq.has_canvas && ((int) rq.canvas_init.size() > L ||
                               rq.canvas_hold.size() != rq.canvas_init.size())) {
             out.error = "atk_canvas: " + std::to_string(rq.canvas_init.size()) + " tokens for a " +
-                        std::to_string(canvas_length) + "-token canvas, or hold of a different length";
+                        std::to_string(L) + "-token canvas, or hold of a different length";
             return out;
         }
         for (size_t i = 0; rq.has_canvas && i < rq.canvas_init.size(); ++i) {
@@ -460,17 +669,48 @@ struct diffusion_server {
                 return out;
             }
         }
+        // ATK patch 4: soft holds and the self-conditioning seed, checked the same way
+        const bool any_soft = rq.has_canvas &&
+            std::find(rq.soft_hold.begin(), rq.soft_hold.end(), (char) 1) != rq.soft_hold.end();
+        if (any_soft && rq.soft_hold.size() != rq.canvas_init.size()) {
+            out.error = "atk_canvas.soft_hold must have one entry per given token";
+            return out;
+        }
+        for (size_t i = 0; any_soft && i < rq.soft_hold.size(); ++i) {
+            if (rq.soft_hold[i] && (rq.canvas_init[i] < 0 || rq.canvas_init[i] >= n_vocab)) {
+                out.error = "atk_canvas: position " + std::to_string(i) + " is soft-held but has no token";
+                return out;
+            }
+            if (rq.soft_hold[i] && rq.canvas_hold[i]) {
+                out.error = "atk_canvas: position " + std::to_string(i) + " is both held and soft-held";
+                return out;
+            }
+        }
+        if (rq.has_sc_seed) {
+            if (rq.sc_seed_k < 1 || rq.sc_seed_k > SC_K) {
+                out.error = "atk_canvas.self_cond.k must be 1.." + std::to_string(SC_K);
+                return out;
+            }
+            if (rq.sc_seed_ids.size() != rq.sc_seed_probs.size() || rq.sc_seed_ids.size() % (size_t) rq.sc_seed_k != 0 ||
+                rq.sc_seed_ids.size() / (size_t) rq.sc_seed_k > (size_t) L) {
+                out.error = "atk_canvas.self_cond: ids/probs must be k entries per position, for at most " +
+                            std::to_string(L) + " positions";
+                return out;
+            }
+        }
         const bool want_readout = rq.readout || rq.has_canvas;
+        // ATK patch 4: the host sampling path runs on EVERY block when any host feature is in use
+        // (patch 3's features ran on block 0 only, because only the read-out block left the device loop)
+        const bool host_path = want_readout || rq.needs_host_path();
         std::vector<int>   flips0;
-        std::vector<float> entropy0;
 
-        std::vector<llama_token> canvas(canvas_length);
-        std::vector<llama_token> argmax_canvas(canvas_length, -1);
-        std::vector<llama_token> prev_argmax(canvas_length, -1);
-        std::vector<llama_token> accepted(canvas_length);
+        std::vector<llama_token> canvas(L);
+        std::vector<llama_token> argmax_canvas(L, -1);
+        std::vector<llama_token> prev_argmax(L, -1);
+        std::vector<llama_token> accepted(L);
         int32_t stop_flag = 0;
-        std::vector<int32_t>     sc_ids ((size_t) SC_K * canvas_length, 0);
-        std::vector<float>       sc_probs((size_t) SC_K * canvas_length, 0.0f);
+        std::vector<int32_t>     sc_ids ((size_t) SC_K * L, 0);
+        std::vector<float>       sc_probs((size_t) SC_K * L, 0.0f);
         std::vector<llama_token> generated;
 
         const bool pin_host_outputs = diffusion.pin_host_outputs;
@@ -482,34 +722,38 @@ struct diffusion_server {
         bool done = false;
         const int topk_max_requested =
             (rq.topk_start > 0 && rq.topk_end > 0) ? std::max(rq.topk_start, rq.topk_end) : rq.topk_fixed;
-        const bool use_device_loop_request = use_device_loop &&
+        const bool use_device_loop_request = use_device_loop && !host_path &&
             (topk_max_requested <= 0 || topk_max_requested <= GPU_SAMPLING_MAX_TOP_K);
+        bool sc_host_valid = false;   // ATK patch 4: sc_ids/sc_probs hold the last step's distributions
+        auto cancel = [&](const char * why) {
+            llama_memory_seq_rm(mem, 0, n_past, -1);
+            out.cancelled = true;
+            out.error = why;
+        };
 
         const auto t_gen0 = std::chrono::steady_clock::now();
         for (int block = 0; block < max_canvases && !done; ++block) {
             ++n_blocks_run;
-            for (auto & t : canvas) t = rand_tok(rng);
+            for (auto & t : canvas) t = draw_noise();
             std::fill(prev_argmax.begin(), prev_argmax.end(), -1);
             llama_set_diffusion_self_cond_topk(ctx, nullptr, nullptr, 0, 0);
 
             // ATK patch 2: lay out the client's first canvas, and where on the noise path to start
-            const bool laid = block == 0 && rq.has_canvas;
-            const bool watch = block == 0 && want_readout;
+            const bool laid  = block == 0 && rq.has_canvas;
+            const bool watch = block == 0 && want_readout;   // read-out accumulation (first canvas)
             int start_step = n_steps;
-            int n_free = canvas_length;
             if (laid) {
-                n_free = 0;
                 for (size_t i = 0; i < rq.canvas_init.size(); ++i) {
                     const llama_token t = rq.canvas_init[i];
                     if (rq.canvas_hold[i]) {
                         canvas[i] = t;
                     } else {
-                        ++n_free;
+                        const bool soft = any_soft && rq.soft_hold[i];
                         const float noise_i = (i < rq.canvas_noise_map.size()) ? rq.canvas_noise_map[i] : rq.canvas_noise;
-                        if (t >= 0 && t < n_vocab && rand_unif(rng) >= noise_i) canvas[i] = t;
+                        if (soft) canvas[i] = t;   // ATK patch 4: a soft hold starts as its token, un-noised
+                        else if (t >= 0 && t < n_vocab && rand_unif(rng) >= noise_i) canvas[i] = t;
                     }
                 }
-                n_free += canvas_length - (int) rq.canvas_init.size();
                 float noise = std::min(std::max(rq.canvas_noise, 0.0f), 1.0f);
                 if (rq.canvas_start >= 0.0f) {
                     noise = rq.canvas_start;
@@ -522,34 +766,73 @@ struct diffusion_server {
                         sum += (i < rq.canvas_noise_map.size()) ? rq.canvas_noise_map[i] : rq.canvas_noise;
                         ++n;
                     }
-                    const int n_blank = canvas_length - (int) rq.canvas_init.size();
+                    const int n_blank = L - (int) rq.canvas_init.size();
                     if (n + n_blank > 0) noise = (float) ((sum + (double) n_blank) / (double) (n + n_blank));
                 }
                 noise = std::min(std::max(noise, 0.0f), 1.0f);
                 start_step = std::max(1, std::min(n_steps, (int) lroundf(noise * (float) n_steps)));
             }
+            // ATK patch 4: seed the first step's self-conditioning (host self-cond): the readout of a
+            // previous request for the kept positions, and the soft holds' own tokens
+            if (block == 0 && (rq.has_sc_seed || any_soft)) {
+                std::fill(sc_ids.begin(),   sc_ids.end(),   0);
+                std::fill(sc_probs.begin(), sc_probs.end(), 0.0f);
+                if (rq.has_sc_seed) {
+                    const int n_given = (int) (rq.sc_seed_ids.size() / (size_t) rq.sc_seed_k);
+                    for (int p = 0; p < n_given; ++p) {
+                        for (int k = 0; k < rq.sc_seed_k; ++k) {
+                            const int32_t id = rq.sc_seed_ids[(size_t) p * rq.sc_seed_k + k];
+                            if (id < 0 || id >= n_vocab) continue;
+                            sc_ids  [(size_t) p * SC_K + k] = id;
+                            sc_probs[(size_t) p * SC_K + k] = std::min(std::max(rq.sc_seed_probs[(size_t) p * rq.sc_seed_k + k], 0.0f), 1.0f);
+                        }
+                    }
+                }
+                for (size_t i = 0; any_soft && i < rq.soft_hold.size(); ++i) {
+                    if (!rq.soft_hold[i]) continue;
+                    std::fill_n(sc_probs.begin() + i * SC_K, SC_K, 0.0f);
+                    sc_ids  [i * SC_K] = rq.canvas_init[i];
+                    sc_probs[i * SC_K] = rq.soft_hold_p;
+                }
+                llama_set_diffusion_self_cond_topk(ctx, sc_ids.data(), sc_probs.data(), SC_K, L);
+                SRV_DBG("self-conditioning seeded: %s%s\n", rq.has_sc_seed ? "readout " : "", any_soft ? "soft-hold" : "");
+            }
             if (watch) {
-                flips0.assign(canvas_length, 0);
-                entropy0.assign(canvas_length, 0.0f);
+                flips0.assign(L, 0);
                 out.canvas0_start = start_step;
             }
-            // ATK patch 3: best-canvas retention and plateau re-noise, per canvas
+            // ATK patch 3: best-canvas retention and plateau re-noise, per canvas (ATK patch 4: on
+            // every host-path block, not only the read-out one)
             float                    best_mean = INFINITY;
             std::vector<llama_token> best_argmax;
             std::vector<float>       best_entropy;
+            std::vector<float>       last_entropy(L, 0.0f);
             float                    prev_mean = INFINITY;
             int                      stall     = 0;
             int                      plateaus  = 0;
             int                      step_no   = 0;
+            // ATK patch 4: per-canvas state for the stop test, EOG tail, sprint and oscillation hold
+            int                      stable_run   = 0;
+            int                      eog_pos_prev = -1;
+            int                      eog_run      = 0;
+            int                      tail_from    = L;    // first position the stop test does not watch
+            int                      tail_first   = -1;   // ... the first time it stopped watching one
+            int                      sprints      = 0;
+            int                      osc_events   = 0;
+            int                      sc_cleared   = 0;
+            std::vector<llama_token> prev2_argmax(L, -1);
+            std::vector<float>       prev_entropy(L, 0.0f);
+            std::vector<int>         alt_run(L, 0);
+            std::vector<llama_token> osc_hold_tok(L, -1);
+            std::vector<int>         osc_hold_left(L, 0);
             auto is_held = [&](int i) {
                 return laid && i < (int) rq.canvas_hold.size() && rq.canvas_hold[i];
             };
+            auto in_tail = [&](int i) { return i >= tail_from; };
 
             for (int cur_step = start_step; cur_step >= 1; --cur_step) {
                 if (hooks && hooks->on_step && !hooks->on_step(block, start_step - cur_step + 1, start_step)) {
-                    llama_memory_seq_rm(mem, 0, n_past, -1);
-                    out.cancelled = true;
-                    out.error = "cancelled: the client went away";
+                    cancel("cancelled: the client went away");
                     return out;
                 }
                 ++n_steps_total;
@@ -557,6 +840,12 @@ struct diffusion_server {
                 ++step_no;
                 const auto t_step0 = std::chrono::steady_clock::now();
                 const float temp = rq.temp_min + (rq.temp_max - rq.temp_min) * ((float) cur_step / (float) n_steps);
+                // schedule progress: 0 at start_step, 1 at the last step (warm noise, budget schedule)
+                const float progress = (start_step > 1) ? (float) (start_step - cur_step) / (float) (start_step - 1) : 1.0f;
+                // ATK patch 4: the entropy budget, scheduled when bound_end is given
+                const float bound = (rq.bound_end >= 0.0f)
+                    ? rq.entropy_bound + (rq.bound_end - rq.entropy_bound) * std::min(std::max(progress, 0.0f), 1.0f)
+                    : rq.entropy_bound;
 
                 int k_step = 0;
                 if (rq.topk_start > 0 && rq.topk_end > 0) {
@@ -572,14 +861,14 @@ struct diffusion_server {
                 // ATK patch 2: a laid-out or read-out canvas is updated on the host, where held
                 // positions can be put back and per-position entropy is visible. Self-conditioning
                 // stays wherever the server keeps it (on the card with the fused input), so the
-                // only cost is copying 256 tokens and their entropies per step.
-                const bool use_device_loop_step = use_device_loop_request && use_gpu_sampling_step && !watch;
+                // only cost is copying the canvas's tokens and entropies per step.
+                const bool use_device_loop_step = use_device_loop_request && use_gpu_sampling_step;
 
                 llama_set_causal_attn(ctx, false);
                 llama_set_diffusion_decoder_phase(ctx, true);
                 llama_set_diffusion_gpu_sampling(ctx, use_gpu_sampling_step);
-                batch.n_tokens = canvas_length;
-                for (int j = 0; j < canvas_length; ++j) {
+                batch.n_tokens = L;
+                for (int j = 0; j < L; ++j) {
                     batch.token[j]     = canvas[j];
                     batch.pos[j]       = n_past + j;
                     batch.n_seq_id[j]  = 1;
@@ -593,8 +882,8 @@ struct diffusion_server {
                 }
                 ++n_decode;
 
-                std::vector<float> entropy(canvas_length);
-                std::vector<llama_token> sampled(canvas_length);
+                std::vector<float> entropy(L);
+                std::vector<llama_token> sampled(L);
 
                 if (use_device_loop_step) {
                     const int block_step = n_steps - cur_step + 1;
@@ -603,7 +892,7 @@ struct diffusion_server {
                     const bool check_stop = use_device_early_stop;
                     stop_flag = 0;
                     llama_diffusion_sample_params sample_params = {
-                        /* .n_tokens              = */ canvas_length,
+                        /* .n_tokens              = */ L,
                         /* .top_k                 = */ k_step,
                         /* .self_cond_top_k       = */ SC_K,
                         /* .temperature           = */ temp,
@@ -653,7 +942,7 @@ struct diffusion_server {
 
                 if (use_gpu_sampling_step) {
                     llama_diffusion_sample_params sample_params = {
-                        /* .n_tokens              = */ canvas_length,
+                        /* .n_tokens              = */ L,
                         /* .top_k                 = */ k_step,
                         /* .self_cond_top_k       = */ SC_K,
                         /* .temperature           = */ temp,
@@ -694,7 +983,7 @@ struct diffusion_server {
                     const auto cmp = [](const std::pair<float,int>&a, const std::pair<float,int>&b){ return a.first > b.first; };
                     std::vector<float> probs(n_vocab);
                     std::vector<std::pair<float,int>> scheap; scheap.reserve(SC_K);
-                    for (int j = 0; j < canvas_length; ++j) {
+                    for (int j = 0; j < L; ++j) {
                         const float * lg = logits + (size_t) j * n_vocab;
                         float maxl = -INFINITY; int amax = 0;
                         scheap.clear();
@@ -732,7 +1021,7 @@ struct diffusion_server {
                     const auto cmp = [](const std::pair<float,int>&a, const std::pair<float,int>&b){ return a.first > b.first; };
                     const int heap_k = std::max(k_step, SC_K);
                     std::vector<std::pair<float,int>> heap; heap.reserve(heap_k);
-                    for (int j = 0; j < canvas_length; ++j) {
+                    for (int j = 0; j < L; ++j) {
                         const float * lg = logits + (size_t) j * n_vocab;
                         float maxl = -INFINITY; int amax = 0;
                         heap.clear();
@@ -775,33 +1064,124 @@ struct diffusion_server {
                 }
 
                 llama_memory_seq_rm(mem, 0, n_past, -1);
+                const bool host_sc = !use_device_self_cond_step;   // the top-k rows are on the host this step
+                sc_host_valid = host_sc;
+
+                // ATK patch 4: edit the distributions on the host (host self-cond): the spatial
+                // repetition penalty, per-position temperature, self-cond sharpening. Each row of
+                // sc_probs is position j's top-k at this step's temperature (entries with p = 0 are
+                // absent). The sample and the argmax are redrawn from the edited distribution; what is
+                // fed back is the ORIGINAL distribution with the penalty applied, raised to sc_sharpen
+                // (the per-position temperature changes how we sample, not what the model remembers).
+                std::vector<float> margin;   // top-1 minus top-2 probability per position (accept_order = margin)
+                const bool want_margin = host_sc && rq.accept_order == "margin";
+                if (host_sc && (rq.rep_penalty > 0.0f || rq.temp_pos_gain != 0.0f || rq.sc_sharpen != 1.0f || want_margin)) {
+                    std::vector<float> z(L, 0.0f);
+                    if (rq.temp_pos_gain != 0.0f) {
+                        std::vector<int> by_ent(L);
+                        std::iota(by_ent.begin(), by_ent.end(), 0);
+                        std::sort(by_ent.begin(), by_ent.end(), [&](int a, int b) { return entropy[a] < entropy[b]; });
+                        for (int r = 0; r < L; ++r) z[by_ent[r]] = (L > 1) ? (2.0f * (float) r / (float) (L - 1) - 1.0f) : 0.0f;
+                    }
+                    std::unordered_map<int32_t, std::vector<std::pair<int, float>>> where;   // token -> (position, p)
+                    if (rq.rep_penalty > 0.0f) {
+                        for (int j = 0; j < L; ++j) {
+                            const int32_t * id = sc_ids.data()   + (size_t) j * SC_K;
+                            const float   * pr = sc_probs.data() + (size_t) j * SC_K;
+                            for (int k = 0; k < SC_K; ++k) {
+                                if (pr[k] > 0.0f && rep_may_penalize(id[k], rq.rep_min_chars)) where[id[k]].push_back({j, pr[k]});
+                            }
+                        }
+                    }
+                    if (want_margin) margin.assign(L, 1.0f);
+                    std::vector<float> pen(SC_K), samp(SC_K);
+                    for (int j = 0; j < L; ++j) {
+                        if (is_held(j)) continue;
+                        int32_t * id = sc_ids.data()   + (size_t) j * SC_K;
+                        float   * pr = sc_probs.data() + (size_t) j * SC_K;
+                        float expo = 1.0f;
+                        if (rq.temp_pos_gain != 0.0f) {
+                            expo = 1.0f / std::max(1.0f + rq.temp_pos_gain * z[j], 0.05f);
+                            expo = std::min(std::max(expo, 0.25f), 4.0f);
+                        }
+                        float Zs = 0.0f;
+                        for (int k = 0; k < SC_K; ++k) {
+                            pen[k] = 1.0f;
+                            if (pr[k] <= 0.0f) { samp[k] = 0.0f; continue; }
+                            if (rq.rep_penalty > 0.0f) {
+                                const auto it = where.find(id[k]);
+                                if (it != where.end()) {
+                                    float s = 0.0f;
+                                    for (const auto & pq : it->second) {
+                                        const int d = std::abs(pq.first - j);
+                                        if (d == 0 || d > rq.rep_window) continue;
+                                        s += pq.second * expf(-(float) (d - 1) / std::max(rq.rep_decay, 1e-3f));
+                                    }
+                                    if (s > 0.0f) pen[k] = expf(-rq.rep_penalty * s);
+                                }
+                            }
+                            samp[k] = (expo == 1.0f ? pr[k] : powf(pr[k], expo)) * pen[k];
+                            Zs += samp[k];
+                        }
+                        if (Zs <= 0.0f) continue;
+                        // redraw the sample and the argmax from the edited distribution
+                        const float r = rand_unif(rng) * Zs;
+                        float cum = 0.0f; int tok = -1, amax = 0; float best = -1.0f, second = -1.0f;
+                        for (int k = 0; k < SC_K; ++k) {
+                            if (samp[k] <= 0.0f) continue;
+                            cum += samp[k];
+                            if (tok < 0 && cum >= r) tok = id[k];
+                            if (samp[k] > best) { second = best; best = samp[k]; amax = id[k]; }
+                            else if (samp[k] > second) { second = samp[k]; }
+                        }
+                        if (tok < 0) tok = amax;
+                        sampled[j] = tok; argmax_canvas[j] = amax;
+                        if (want_margin) margin[j] = (best - std::max(second, 0.0f)) / Zs;
+                        // what the model remembers: original x penalty, sharpened, renormalised
+                        float Zf = 0.0f;
+                        for (int k = 0; k < SC_K; ++k) {
+                            if (pr[k] <= 0.0f) continue;
+                            float f = pr[k] * pen[k];
+                            if (rq.sc_sharpen != 1.0f) f = powf(f, rq.sc_sharpen);
+                            pr[k] = f; Zf += f;
+                        }
+                        if (Zf > 0.0f) for (int k = 0; k < SC_K; ++k) pr[k] /= Zf;
+                    }
+                } else if (want_margin) {
+                    margin.assign(L, 1.0f);
+                    for (int j = 0; j < L; ++j) {
+                        const float * pr = sc_probs.data() + (size_t) j * SC_K;
+                        float best = -1.0f, second = -1.0f, Z = 0.0f;
+                        for (int k = 0; k < SC_K; ++k) {
+                            Z += pr[k];
+                            if (pr[k] > best) { second = best; best = pr[k]; } else if (pr[k] > second) { second = pr[k]; }
+                        }
+                        if (Z > 0.0f) margin[j] = (best - std::max(second, 0.0f)) / Z;
+                    }
+                }
 
                 // ATK patch 2: a held position is certain by definition: it IS the held token, it
                 // spends none of the entropy budget, and it does not count toward stopping.
-                float ent_sum = 0.0f;
-                for (int i = 0; i < canvas_length; ++i) {
+                for (int i = 0; i < L; ++i) {
                     if (is_held(i)) {
                         entropy[i] = 0.0f;
                         sampled[i] = argmax_canvas[i] = rq.canvas_init[i];
-                    } else {
-                        ent_sum += entropy[i];
                     }
                 }
                 int flips_step = 0;
                 if (watch) {
-                    for (int i = 0; i < canvas_length; ++i) {
+                    for (int i = 0; i < L; ++i) {
                         if (prev_argmax[i] >= 0 && prev_argmax[i] != argmax_canvas[i]) { ++flips0[i]; ++flips_step; }
                     }
-                    entropy0 = entropy;
                 }
 
                 // ATK patch 3: a control token (other than end-of-generation) sampled into a text
                 // position is counted always, and refused when the request asks for it. This is
                 // the diagnostic for the eaten-character defect: a control token renders as an
                 // EMPTY piece, so the text on either side of it is glued together.
-                std::vector<char> ctrl_sampled(canvas_length, 0);
+                std::vector<char> ctrl_sampled(L, 0);
                 int n_ctrl = 0;
-                for (int i = 0; i < canvas_length; ++i) {
+                for (int i = 0; i < L; ++i) {
                     if (is_held(i)) continue;
                     const llama_token t = sampled[i];
                     if (t >= 0 && t < n_vocab && llama_vocab_is_control(vocab, t) && !llama_vocab_is_eog(vocab, t)) {
@@ -809,27 +1189,68 @@ struct diffusion_server {
                     }
                 }
 
-                std::vector<int> order(canvas_length);
-                std::iota(order.begin(), order.end(), 0);
-                std::sort(order.begin(), order.end(), [&](int a, int b) { return entropy[a] < entropy[b]; });
-                std::vector<char> accept_mask(canvas_length, 0);
-                float prefix = 0.0f;
-                for (int k = 0; k < canvas_length; ++k) {
-                    if (prefix > rq.entropy_bound) break;
-                    if (rq.no_control && ctrl_sampled[order[k]]) continue;   // ATK patch 3
-                    accept_mask[order[k]] = 1; prefix += entropy[order[k]];
+                // ATK patch 4: the post-EOG tail. The first position whose argmax is end-of-generation,
+                // and how many steps running it has been there; once stable, the positions after it
+                // leave the stop test, the acceptance budget and the plateau's demolition set.
+                int eog_pos = -1;
+                for (int i = 0; i < L; ++i) {
+                    const llama_token t = argmax_canvas[i];
+                    if (t >= 0 && t < n_vocab && llama_vocab_is_eog(vocab, t)) { eog_pos = i; break; }
                 }
-                for (int i = 0; i < canvas_length; ++i) if (accept_mask[i]) accepted[i] = sampled[i];
+                if (eog_pos >= 0 && eog_pos == eog_pos_prev) ++eog_run; else eog_run = (eog_pos >= 0) ? 1 : 0;
+                eog_pos_prev = eog_pos;
+                tail_from = (rq.eog_tail && eog_pos >= 0 && eog_run >= rq.eog_tail_stable) ? eog_pos + 1 : L;
+                if (tail_from < L && tail_first < 0) tail_first = tail_from;
 
-                const float mean_ent = ent_sum / (float) std::max(1, n_free);
-                const bool stable    = (STABILITY_THRESHOLD == 0) || (argmax_canvas == prev_argmax);
+                // the stop test's view: unheld positions that are not the tail
+                float ent_sum = 0.0f; int n_watch = 0;
+                for (int i = 0; i < L; ++i) {
+                    if (is_held(i) || in_tail(i)) continue;
+                    ent_sum += entropy[i]; ++n_watch;
+                }
+
+                // acceptance order (ATK patch 4: pos_bias, or the top-1/top-2 margin), budget in raw entropy
+                std::vector<float> key(L);
+                for (int i = 0; i < L; ++i) {
+                    key[i] = want_margin ? (1.0f - margin[i]) : entropy[i] * (1.0f + rq.pos_bias * (float) i / (float) std::max(L - 1, 1));
+                }
+                std::vector<int> order(L);
+                std::iota(order.begin(), order.end(), 0);
+                std::sort(order.begin(), order.end(), [&](int a, int b) { return key[a] < key[b]; });
+                std::vector<char> accept_mask(L, 0);
+                float prefix = 0.0f;
+                for (int k = 0; k < L; ++k) {
+                    if (prefix > bound) break;
+                    const int i = order[k];
+                    if (in_tail(i)) continue;                                   // ATK patch 4: the tail buys nothing
+                    if (rq.no_control && ctrl_sampled[i]) continue;             // ATK patch 3
+                    accept_mask[i] = 1; prefix += entropy[i];
+                }
+                for (int i = 0; i < L; ++i) if (accept_mask[i]) accepted[i] = sampled[i];
+
+                const float mean_ent = ent_sum / (float) std::max(1, n_watch);
+                // ATK patch 4: stability over the watched positions, for stability_steps running
+                bool same = true;
+                for (int i = 0; i < L && same; ++i) {
+                    if (is_held(i) || in_tail(i)) continue;
+                    if (prev_argmax[i] < 0 || prev_argmax[i] != argmax_canvas[i]) same = false;
+                }
+                stable_run = same ? stable_run + 1 : 0;
+                const bool stable    = (STABILITY_THRESHOLD == 0) || stable_run >= std::max(rq.stability_steps, 1);
                 const bool confident = mean_ent < rq.stop_entropy;
 
-                // ATK patch 3: remember the best canvas seen (lowest mean entropy over free positions)
-                if (watch && mean_ent < best_mean) {
+                // ATK patch 3: remember the best canvas seen (lowest mean entropy over watched positions)
+                if (mean_ent < best_mean) {
                     best_mean    = mean_ent;
                     best_argmax  = argmax_canvas;
                     best_entropy = entropy;
+                }
+
+                // ATK patch 4: sprint -- already confident for where the schedule is: cool faster
+                bool sprint_fired = false;
+                if (!(stable && confident) && rq.sprint_below > 0.0f && mean_ent < rq.sprint_below && cur_step > rq.sprint_min) {
+                    cur_step = std::max(rq.sprint_min, cur_step - std::max(rq.sprint_jump, 1));
+                    ++sprints; sprint_fired = true;
                 }
 
                 // ATK patch 3: plateau re-noise. Runs only when the stop test has NOT passed.
@@ -838,88 +1259,206 @@ struct diffusion_server {
                 if (!(stable && confident) && rq.plateau_steps > 0 && plateaus < rq.plateau_max) {
                     if (prev_mean - mean_ent < rq.plateau_eps) ++stall; else stall = 0;
                     if (stall >= rq.plateau_steps) {
-                        demolished.assign(canvas_length, 0);
-                        const int n_demo = std::max(1, (int) lroundf(rq.plateau_frac * (float) std::max(1, n_free)));
+                        demolished.assign(L, 0);
+                        const int n_demo = std::max(1, (int) lroundf(rq.plateau_frac * (float) std::max(1, n_watch)));
                         int c = 0;
-                        for (int k = canvas_length - 1; k >= 0 && c < n_demo; --k) {   // order[] is ascending: the end is the noisiest
-                            const int pidx = order[k];
-                            if (is_held(pidx)) continue;
+                        // order[] is ascending in the acceptance key; walk it from the noisy end, by entropy
+                        std::vector<int> by_ent(L);
+                        std::iota(by_ent.begin(), by_ent.end(), 0);
+                        std::sort(by_ent.begin(), by_ent.end(), [&](int a, int b) { return entropy[a] < entropy[b]; });
+                        for (int k = L - 1; k >= 0 && c < n_demo; --k) {
+                            const int pidx = by_ent[k];
+                            if (is_held(pidx) || in_tail(pidx)) continue;
                             demolished[pidx] = 1; ++c;
                             if (pidx > 0 && !is_held(pidx - 1)) demolished[pidx - 1] = 1;
-                            if (pidx + 1 < canvas_length && !is_held(pidx + 1)) demolished[pidx + 1] = 1;
+                            if (pidx + 1 < L && !is_held(pidx + 1) && !in_tail(pidx + 1)) demolished[pidx + 1] = 1;
                         }
-                        for (int i = 0; i < canvas_length; ++i) if (demolished[i]) accept_mask[i] = 0;
+                        for (int i = 0; i < L; ++i) if (demolished[i]) accept_mask[i] = 0;
                         cur_step = std::min(start_step, cur_step + rq.plateau_extra);
                         stall = 0; ++plateaus; plateau_fired = true;
+                        SRV_DBG("plateau %d/%d at step %d: %d positions demolished, +%d steps\n",
+                                plateaus, rq.plateau_max, step_no, c, rq.plateau_extra);
                     }
                 }
                 prev_mean = mean_ent;
 
+                // ATK patch 4: oscillation hold. alt_run counts steps of A,B,A,B alternation; when a
+                // few positions oscillate and nothing else moves, pin each to its lower-entropy state.
+                int osc_new = 0;
+                if (rq.osc_steps > 0) {
+                    for (int i = 0; i < L; ++i) {
+                        if (is_held(i) || in_tail(i) || osc_hold_left[i] > 0) { alt_run[i] = 0; continue; }
+                        const bool alternating = prev2_argmax[i] >= 0 && prev_argmax[i] >= 0 &&
+                            argmax_canvas[i] == prev2_argmax[i] && argmax_canvas[i] != prev_argmax[i];
+                        alt_run[i] = alternating ? alt_run[i] + 1 : 0;
+                    }
+                    if (!(stable && confident)) {
+                        std::vector<int> osc;
+                        for (int i = 0; i < L; ++i) if (alt_run[i] >= rq.osc_steps) osc.push_back(i);
+                        if (!osc.empty() && (int) osc.size() <= rq.osc_max_pos) {
+                            for (const int i : osc) {
+                                osc_hold_tok[i]  = (entropy[i] <= prev_entropy[i]) ? argmax_canvas[i] : prev_argmax[i];
+                                osc_hold_left[i] = std::max(rq.osc_hold_steps, 1);
+                                alt_run[i] = 0; ++osc_new;
+                            }
+                            osc_events += osc_new;
+                            SRV_DBG("oscillation hold at step %d: %d position(s) pinned for %d steps\n", step_no, osc_new, rq.osc_hold_steps);
+                        }
+                    }
+                }
+                int osc_active = 0;
+                for (int i = 0; i < L; ++i) if (osc_hold_left[i] > 0) ++osc_active;
+
+                int n_acc = 0;
+                for (int i = 0; i < L; ++i) n_acc += accept_mask[i] ? 1 : 0;
                 if (watch) {
-                    int n_acc = 0;
-                    for (int i = 0; i < canvas_length; ++i) n_acc += accept_mask[i] ? 1 : 0;
                     diffusion_result::step_stat st;
                     st.step = step_no; st.cur_step = cur_step; st.mean_entropy = mean_ent; st.accepted = n_acc;
                     st.flips = flips_step; st.control = n_ctrl; st.temp = temp; st.plateau = plateau_fired;
+                    st.sprint = sprint_fired; st.eog_pos = eog_pos; st.tail = L - tail_from; st.osc_holds = osc_active; st.bound = bound;
                     st.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_step0).count();
+                    if (rq.trajectory_text) st.text = common_detokenize(vocab, argmax_canvas, false);
                     out.canvas0_trajectory.push_back(st);
+                }
+                last_entropy = entropy;
+                if (hooks && hooks->on_step_done && rq.stream_steps &&
+                    !hooks->on_step_done(block, step_no, argmax_canvas, entropy, mean_ent, n_acc)) {
+                    cancel("cancelled: the client went away");
+                    return out;
                 }
 
                 if (stable && confident) break;
-                prev_argmax = argmax_canvas;
+                prev2_argmax = prev_argmax;
+                prev_argmax  = argmax_canvas;
+                prev_entropy = entropy;
 
-                if (!use_device_self_cond_step) {
-                    llama_set_diffusion_self_cond_topk(ctx, sc_ids.data(), sc_probs.data(), SC_K, canvas_length);
+                if (host_sc) {
+                    llama_set_diffusion_self_cond_topk(ctx, sc_ids.data(), sc_probs.data(), SC_K, L);
                 }
 
                 // ATK patch 3: warm noise. A rejected position keeps the model's own sample with
                 // probability rho instead of a uniform random token (never a control token, and
-                // never for a position a plateau just demolished — those get pure noise, which
+                // never for a position a plateau just demolished -- those get pure noise, which
                 // is the point of demolishing them). rho runs warm_start -> warm_end over the
-                // schedule; progress is 0 at start_step and 1 at the last step.
-                const float progress = (start_step > 1) ? (float) (start_step - cur_step) / (float) (start_step - 1) : 1.0f;
+                // schedule. ATK patch 4 adds, in this order: an oscillation hold (the position is
+                // pinned), the pad token for the post-EOG tail, lateral noise (a neighbour's
+                // distribution), then warm noise, then uniform noise -- over text tokens only with
+                // noise_text -- and the forgetting of self-conditioning for demolished / re-noised
+                // positions.
                 const float rho = std::min(std::max(rq.warm_start + (rq.warm_end - rq.warm_start) * progress, 0.0f), 1.0f);
-                for (int i = 0; i < canvas_length; ++i) {
+                std::vector<int32_t> clear_pos;
+                for (int i = 0; i < L; ++i) {
+                    if (osc_hold_left[i] > 0) { canvas[i] = osc_hold_tok[i]; --osc_hold_left[i]; continue; }
                     if (accept_mask[i]) { canvas[i] = accepted[i]; continue; }
+                    if (in_tail(i) && rq.eog_tail_pad) { canvas[i] = pad_token; continue; }
                     const bool demo = !demolished.empty() && demolished[i];
-                    if (rho > 0.0f && !demo && !ctrl_sampled[i] && rand_unif(rng) < rho) canvas[i] = sampled[i];
-                    else canvas[i] = rand_tok(rng);
+                    bool drew = false;
+                    if (!demo && host_sc && rq.lateral_noise > 0.0f && rand_unif(rng) < rq.lateral_noise) {
+                        int j = (rand_unif(rng) < 0.5f) ? i - 1 : i + 1;
+                        if (j < 0 || j >= L || is_held(j)) j = (j < 0) ? i + 1 : i - 1;
+                        if (j >= 0 && j < L && !is_held(j)) {
+                            const int32_t * id = sc_ids.data()   + (size_t) j * SC_K;
+                            const float   * pr = sc_probs.data() + (size_t) j * SC_K;
+                            float Z = 0.0f;
+                            for (int k = 0; k < SC_K; ++k) Z += pr[k];
+                            if (Z > 0.0f) {
+                                const float r = rand_unif(rng) * Z;
+                                float cum = 0.0f;
+                                for (int k = 0; k < SC_K; ++k) {
+                                    cum += pr[k];
+                                    if (pr[k] > 0.0f && cum >= r) { canvas[i] = id[k]; drew = true; break; }
+                                }
+                            }
+                        }
+                    }
+                    if (!drew) {
+                        if (rho > 0.0f && !demo && !ctrl_sampled[i] && rand_unif(rng) < rho) canvas[i] = sampled[i];
+                        else canvas[i] = draw_noise();
+                    }
+                    if (demo ? rq.demolish_clear_sc : rq.noise_clear_sc) clear_pos.push_back(i);
                 }
                 for (int i = 0; laid && i < (int) rq.canvas_hold.size(); ++i) {
                     if (rq.canvas_hold[i]) canvas[i] = rq.canvas_init[i];
                 }
+                if (!clear_pos.empty()) {
+                    const int32_t n = llama_diffusion_self_cond_clear(ctx, clear_pos.data(), (int32_t) clear_pos.size());
+                    if (n > 0) sc_cleared += n;
+                    else if (n < 0) SRV_DBG("self-cond clear: no live state at step %d (%zu positions)\n", step_no, clear_pos.size());
+                }
             }
-            if (watch) {
-                // ATK patch 3: the last step's mean entropy, and the swap to the best canvas when
-                // the last is worse. The swap is made in argmax_canvas ITSELF (element copy, not
-                // reassignment: the vector is pinned host memory) so that the readout, the text
-                // in choices and the canvas committed to the KV all agree.
-                float last_sum = 0.0f;
-                for (int i = 0; i < canvas_length; ++i) if (!is_held(i)) last_sum += entropy0[i];
-                const float last_mean = last_sum / (float) std::max(1, n_free);
-                out.canvas0_last_entropy = last_mean;
-                out.canvas0_best_entropy = (best_mean < INFINITY) ? best_mean : last_mean;
-                out.canvas0_plateaus     = plateaus;
+            // ATK patch 3: the last step's mean entropy, and the swap to the best canvas when the last
+            // is worse. The swap is made in argmax_canvas ITSELF (element copy, not reassignment: the
+            // vector is pinned host memory) so that the readout, the text in choices and the canvas
+            // committed to the KV all agree. ATK patch 4: on every host-path block.
+            if (host_path) {
+                float last_sum = 0.0f; int n_last = 0;
+                for (int i = 0; i < L; ++i) {
+                    if (is_held(i) || in_tail(i)) continue;
+                    last_sum += last_entropy[i]; ++n_last;
+                }
+                const float last_mean = last_sum / (float) std::max(1, n_last);
+                bool from_best = false;
                 if (rq.keep_best && !best_argmax.empty() && best_mean < last_mean - 1e-6f) {
                     std::copy(best_argmax.begin(), best_argmax.end(), argmax_canvas.begin());
-                    entropy0 = best_entropy;
-                    out.canvas0_from_best = true;
+                    last_entropy = best_entropy;
+                    from_best = true;
                 }
-                out.has_readout     = true;
-                out.canvas0         = argmax_canvas;
-                out.canvas0_entropy = entropy0;
-                out.canvas0_flips   = flips0;
-                int n_ctrl_out = 0;
-                for (const llama_token t : argmax_canvas) {
-                    if (t >= 0 && t < n_vocab && llama_vocab_is_control(vocab, t) && !llama_vocab_is_eog(vocab, t)) ++n_ctrl_out;
+                if (watch) {
+                    out.canvas0_last_entropy = last_mean;
+                    out.canvas0_best_entropy = (best_mean < INFINITY) ? best_mean : last_mean;
+                    out.canvas0_plateaus     = plateaus;
+                    out.canvas0_from_best    = from_best;
+                    out.canvas0_sprints      = sprints;
+                    out.canvas0_osc_holds    = osc_events;
+                    out.canvas0_sc_cleared   = sc_cleared;
+                    out.canvas0_tail_from    = tail_first;
+                    out.canvas0_host_sc      = sc_host_valid;
+                    out.has_readout     = true;
+                    out.canvas0         = argmax_canvas;
+                    out.canvas0_entropy = last_entropy;
+                    out.canvas0_flips   = flips0;
+                    int n_ctrl_out = 0, eog_out = -1;
+                    for (int i = 0; i < L; ++i) {
+                        const llama_token t = argmax_canvas[i];
+                        if (t < 0 || t >= n_vocab) continue;
+                        if (llama_vocab_is_eog(vocab, t)) { if (eog_out < 0) eog_out = i; }
+                        else if (llama_vocab_is_control(vocab, t)) ++n_ctrl_out;
+                    }
+                    out.canvas0_control = n_ctrl_out;
+                    out.canvas0_eog_pos = eog_out;
+                    // ATK patch 4: the self-conditioning readout -- the LAST step's top-N per position
+                    // (when the returned canvas is the best seen rather than the last, the memory is
+                    // still the last step's; the client re-noises what it rejects anyway)
+                    if (rq.sc_out_k > 0 && sc_host_valid) {
+                        const int N = std::min(rq.sc_out_k, SC_K);
+                        out.sc_out_k = N;
+                        out.sc_out_ids.assign((size_t) N * L, -1);
+                        out.sc_out_probs.assign((size_t) N * L, 0.0f);
+                        std::vector<std::pair<float, int32_t>> row;
+                        for (int j = 0; j < L; ++j) {
+                            row.clear();
+                            for (int k = 0; k < SC_K; ++k) {
+                                const float p = sc_probs[(size_t) j * SC_K + k];
+                                if (p > 0.0f) row.push_back({p, sc_ids[(size_t) j * SC_K + k]});
+                            }
+                            const int n = std::min(N, (int) row.size());
+                            std::partial_sort(row.begin(), row.begin() + n, row.end(),
+                                              [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) { return a.first > b.first; });
+                            for (int k = 0; k < n; ++k) {
+                                out.sc_out_ids  [(size_t) j * N + k] = row[k].second;
+                                out.sc_out_probs[(size_t) j * N + k] = row[k].first;
+                            }
+                        }
+                    }
                 }
-                out.canvas0_control = n_ctrl_out;
+                SRV_DBG("block %d: %d steps, last mean entropy %.4f, best %.4f%s, plateaus %d, sprints %d, osc holds %d, sc cleared %d, tail from %d\n",
+                        block, step_no, last_mean, best_mean, from_best ? " (returned)" : "", plateaus, sprints, osc_events, sc_cleared, tail_first);
             }
 
             const std::vector<llama_token> & block_out = argmax_canvas;
             generated.insert(generated.end(), block_out.begin(), block_out.end());
             if (!rq.ignore_eos) {
-                for (int j = 0; j < canvas_length; ++j) {
+                for (int j = 0; j < L; ++j) {
                     if (llama_vocab_is_eog(vocab, block_out[j])) { done = true; break; }
                 }
             }
@@ -934,7 +1473,7 @@ struct diffusion_server {
                     out.error = "canvas commit (encoder) decode failed";
                     return out;
                 }
-                n_past += canvas_length;
+                n_past += L;
                 kv_tokens.insert(kv_tokens.end(), block_out.begin(), block_out.end());
             }
         }
@@ -961,7 +1500,7 @@ struct diffusion_server {
         out.answer_tokens = (int) answer.size();
         out.n_blocks      = n_blocks_run;
         out.n_steps_total = n_steps_total;
-        out.canvas_tokens = n_blocks_run * canvas_length;
+        out.canvas_tokens = n_blocks_run * L;
         out.n_decode      = n_decode;
         out.ok            = true;
         return out;
@@ -1095,8 +1634,40 @@ static diffusion_request request_from_body(const json & body, const diffusion_se
         integer("plateau_steps", rq.plateau_steps, 0, 1000);
         integer("plateau_extra", rq.plateau_extra, 0, 1000);
         integer("plateau_max",   rq.plateau_max,   0, 100);
-        if (sm.contains("keep_best")  && sm["keep_best"].is_boolean())  rq.keep_best  = sm["keep_best"].get<bool>();
-        if (sm.contains("no_control") && sm["no_control"].is_boolean()) rq.no_control = sm["no_control"].get<bool>();
+        auto boolean = [&](const char * k, bool & dst) {
+            if (sm.contains(k) && sm[k].is_boolean()) dst = sm[k].get<bool>();
+        };
+        boolean("keep_best",  rq.keep_best);
+        boolean("no_control", rq.no_control);
+        // ATK patch 4
+        integer("canvas_length",   rq.canvas_len_req,  0, 4096);
+        integer("stability_steps", rq.stability_steps, 1, 100);
+        boolean("eog_tail",        rq.eog_tail);
+        integer("eog_tail_stable", rq.eog_tail_stable, 1, 100);
+        boolean("eog_tail_pad",    rq.eog_tail_pad);
+        boolean("noise_text",      rq.noise_text);
+        boolean("noise_clear_sc",  rq.noise_clear_sc);
+        boolean("demolish_clear_sc", rq.demolish_clear_sc);
+        num("sprint_below",      rq.sprint_below,  0.0f, 1000.0f);
+        integer("sprint_jump",   rq.sprint_jump,   1, 1000);
+        integer("sprint_min",    rq.sprint_min,    1, 1000);
+        num("pos_bias",          rq.pos_bias,     -0.99f, 100.0f);
+        if (sm.contains("accept_order") && sm["accept_order"].is_string()) {
+            const std::string v = sm["accept_order"].get<std::string>();
+            if (v == "entropy" || v == "margin") rq.accept_order = v;
+        }
+        num("bound_end",         rq.bound_end,    -1.0f, 1000.0f);
+        num("temp_pos_gain",     rq.temp_pos_gain, -0.9f, 10.0f);
+        num("rep_penalty",       rq.rep_penalty,   0.0f, 100.0f);
+        integer("rep_window",    rq.rep_window,    1, 4096);
+        num("rep_decay",         rq.rep_decay,     0.001f, 1000.0f);
+        integer("rep_min_chars", rq.rep_min_chars, 1, 64);
+        num("sc_sharpen",        rq.sc_sharpen,    0.05f, 20.0f);
+        num("lateral_noise",     rq.lateral_noise, 0.0f, 1.0f);
+        integer("osc_steps",     rq.osc_steps,     0, 1000);
+        integer("osc_max_pos",   rq.osc_max_pos,   1, 4096);
+        integer("osc_hold_steps", rq.osc_hold_steps, 1, 1000);
+        integer("n_candidates",  rq.n_candidates,  1, 64);
     }
     if (body.contains("atk_canvas") && body["atk_canvas"].is_object()) {
         const json & cv = body["atk_canvas"];
@@ -1117,9 +1688,43 @@ static diffusion_request request_from_body(const json & body, const diffusion_se
             }
         }
         if (cv.contains("start") && cv["start"].is_number()) rq.canvas_start = std::min(std::max(cv["start"].get<float>(), 0.0f), 1.0f);
+        // ATK patch 4
+        if (cv.contains("length") && cv["length"].is_number_integer()) rq.canvas_len_req = (int) cv["length"].get<int64_t>();
+        if (cv.contains("soft_hold") && cv["soft_hold"].is_array()) {
+            for (const auto & h : cv["soft_hold"]) rq.soft_hold.push_back((char) ((h.is_boolean() && h.get<bool>()) || (h.is_number_integer() && h.get<int64_t>() != 0)));
+        }
+        if (cv.contains("soft_hold_p") && cv["soft_hold_p"].is_number()) rq.soft_hold_p = std::min(std::max(cv["soft_hold_p"].get<float>(), 0.0f), 1.0f);
+        if (cv.contains("self_cond") && cv["self_cond"].is_object()) {
+            const json & sc = cv["self_cond"];
+            const int k = (sc.contains("k") && sc["k"].is_number_integer()) ? (int) sc["k"].get<int64_t>() : 0;
+            if (k > 0 && sc.contains("ids") && sc["ids"].is_array() && sc.contains("probs") && sc["probs"].is_array() &&
+                sc["ids"].size() == sc["probs"].size()) {
+                rq.has_sc_seed = true;
+                rq.sc_seed_k   = k;
+                for (size_t p = 0; p < sc["ids"].size(); ++p) {
+                    const json & row_i = sc["ids"][p];
+                    const json & row_p = sc["probs"][p];
+                    for (int j = 0; j < k; ++j) {
+                        const bool ok = row_i.is_array() && row_p.is_array() && j < (int) row_i.size() && j < (int) row_p.size() &&
+                                        row_i[j].is_number_integer() && row_p[j].is_number();
+                        rq.sc_seed_ids.push_back(ok ? (int32_t) row_i[j].get<int64_t>() : -1);
+                        rq.sc_seed_probs.push_back(ok ? row_p[j].get<float>() : 0.0f);
+                    }
+                }
+            }
+        }
     }
     if (body.contains("atk_readout") && body["atk_readout"].is_boolean()) rq.readout = body["atk_readout"].get<bool>();
     if (body.contains("atk_cache_prompt") && body["atk_cache_prompt"].is_boolean()) rq.cache_prompt = body["atk_cache_prompt"].get<bool>();
+    // ATK patch 4
+    if (body.contains("atk_readout_sc") && body["atk_readout_sc"].is_number_integer()) rq.sc_out_k = std::min(std::max((int) body["atk_readout_sc"].get<int64_t>(), 0), 4096);
+    if (body.contains("atk_trajectory_text") && body["atk_trajectory_text"].is_boolean()) rq.trajectory_text = body["atk_trajectory_text"].get<bool>();
+    if (body.contains("atk_stream_steps") && body["atk_stream_steps"].is_boolean()) rq.stream_steps = body["atk_stream_steps"].get<bool>();
+    if (rq.sc_out_k > 0 || rq.n_candidates > 1) rq.readout = true;   // both need the per-step bookkeeping
+    // a shorter canvas: max_tokens buys more (shorter) blocks
+    if (rq.canvas_len_req > 0 && max_tokens > 0) {
+        rq.max_canvases = (max_tokens + rq.canvas_len_req - 1) / rq.canvas_len_req;
+    }
     return rq;
 }
 
@@ -1153,11 +1758,15 @@ static json readout_json(const diffusion_server & srv, const diffusion_result & 
     offsets.push_back((int64_t) text.size());
     json traj = json::array();
     for (const auto & st : r.canvas0_trajectory) {
-        traj.push_back(json{
+        json row{
             {"step", st.step}, {"cur_step", st.cur_step}, {"mean_entropy", st.mean_entropy},
             {"accepted", st.accepted}, {"flips", st.flips}, {"control", st.control},
             {"temp", st.temp}, {"ms", st.ms}, {"plateau", st.plateau},
-        });
+            // ATK patch 4
+            {"sprint", st.sprint}, {"eog_pos", st.eog_pos}, {"tail", st.tail}, {"osc_holds", st.osc_holds}, {"bound", st.bound},
+        };
+        if (!st.text.empty()) row["text"] = st.text;   // dumped with the replace handler, like the rest
+        traj.push_back(row);
     }
     // Bytes that are not valid UTF-8 (a canvas can end inside a multi-byte character) must not
     // reach json::dump(), which would throw; such a string goes out as hex instead, flagged.
@@ -1191,8 +1800,28 @@ static json readout_json(const diffusion_server & srv, const diffusion_result & 
         {"trajectory", traj}, {"plateaus", r.canvas0_plateaus},
         {"from_best", r.canvas0_from_best},
         {"best_entropy", r.canvas0_best_entropy}, {"last_entropy", r.canvas0_last_entropy},
+        // ATK patch 4
+        {"length", r.canvas0_length}, {"sprints", r.canvas0_sprints}, {"osc_holds", r.canvas0_osc_holds},
+        {"eog_pos", r.canvas0_eog_pos}, {"tail_from", r.canvas0_tail_from},
+        {"sc_cleared", r.canvas0_sc_cleared}, {"host_self_cond", r.canvas0_host_sc},
     };
     if (text_utf8) out["text"] = text; else out["text_hex"] = text_hex;
+    // ATK patch 4: the self-conditioning readout, top-N per position (atk_readout_sc)
+    if (r.sc_out_k > 0 && !r.sc_out_ids.empty()) {
+        const int N = r.sc_out_k;
+        const size_t L = r.sc_out_ids.size() / (size_t) N;
+        json ids = json::array(), probs = json::array();
+        for (size_t j = 0; j < L; ++j) {
+            json ri = json::array(), rp = json::array();
+            for (int k = 0; k < N; ++k) {
+                if (r.sc_out_ids[j * N + k] < 0) break;
+                ri.push_back(r.sc_out_ids[j * N + k]);
+                rp.push_back(r.sc_out_probs[j * N + k]);
+            }
+            ids.push_back(ri); probs.push_back(rp);
+        }
+        out["self_cond"] = json{{"k", N}, {"ids", ids}, {"probs", probs}};
+    }
     return out;
 }
 
@@ -1244,18 +1873,16 @@ int main(int argc, char ** argv) {
 
     SRV_INF("%s\n", "loading model");
 
-    llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = params.n_gpu_layers >= 0 ? params.n_gpu_layers : 999;
-    model_params.devices      = params.devices.data();
-    model_params.use_mmap     = params.use_mmap;
-    model_params.use_extra_bufts = !params.no_extra_bufts;
-    model_params.no_host         = params.no_host;
-    // ATK patch: -ot / --cpu-moe / --n-cpu-moe are parsed by common_params_parse but were never
-    // handed to the loader, so a MoE model could not keep its experts in system RAM. The parser
-    // pads the list with {nullptr, nullptr} terminators, which is what the loader expects.
-    model_params.tensor_buft_overrides =
-        (params.tensor_buft_overrides.empty() || params.tensor_buft_overrides.front().pattern == nullptr)
-            ? nullptr : params.tensor_buft_overrides.data();
+    // ATK patch 4: build the loader params the way every other example does, from common's
+    // converter, so EVERY flag common_params_parse accepts reaches the loader: -ot / --cpu-moe /
+    // --n-cpu-moe (patch 2 passed these by hand), and now also --override-kv (e.g.
+    // diffusion-gemma.expert_used_count=int:N), --mlock, --no-mmap, -sm / -ts / -mg,
+    // --check-tensors. Before this, those were parsed and silently dropped. The one default kept
+    // from the PR: without -ngl, offload every layer (999), not common's -1 "auto-fit".
+    llama_model_params model_params = common_model_params_to_llama(params);
+    if (params.n_gpu_layers < 0) {
+        model_params.n_gpu_layers = 999;
+    }
 
     diffusion_server srv;
     srv.model = llama_model_load_from_file(params.model.path.c_str(), model_params);
@@ -1295,12 +1922,18 @@ int main(int argc, char ** argv) {
         if (srv.model_id.empty()) srv.model_id = "diffusion-gemma";
     }
 
-    llama_context_params ctx_params = llama_context_default_params();
+    // ATK patch 4: same for the context: -fa, -ctk / -ctv (KV cache quantization: VRAM freed here
+    // is VRAM for experts), --no-kv-offload, -t / -tb, --no-op-offload (patch 2 passed this one by
+    // hand) now all apply. Two things are then pinned to what the sampler relies on: the batch
+    // is the canvas (one ubatch per denoising step), and the SWA cache is FULL-size -- common's
+    // default is the window-size cache, but the prefix cache (patch 2) removes the canvas's K/V
+    // and the tail of a changed prompt with llama_memory_seq_rm, which is exact only on a
+    // full-size cache (llama's own default; the PR relied on it implicitly).
+    llama_context_params ctx_params = common_context_params_to_llama(params);
     ctx_params.n_ctx    = srv.n_ctx;
     ctx_params.n_batch  = srv.n_ub;
     ctx_params.n_ubatch = srv.n_ub;
-    ctx_params.no_perf  = params.no_perf;
-    ctx_params.op_offload = !params.no_op_offload;   // ATK patch: honour --no-op-offload
+    ctx_params.swa_full = true;
     ctx_params.diffusion_self_cond_top_k = srv.diffusion.self_cond_top_k;
     ctx_params.diffusion_input_gpu_groups = srv.diffusion.input_gpu_groups;
     ctx_params.diffusion_fused_self_cond_embd = srv.diffusion.fused_self_cond_embd;
@@ -1328,6 +1961,13 @@ int main(int argc, char ** argv) {
     srv.device_early_stop_interval =
         srv.use_device_loop && !params.diffusion.run_max_denoising_step ? 1 : 0;
     llama_set_diffusion_gpu_sampling(srv.ctx, srv.use_gpu_sampling);
+    // ATK patch 4: the top-k rows are on the host whenever self-conditioning is not kept on the device
+    srv.host_self_cond = !srv.use_device_self_cond;
+    srv.init_atk_tables();
+    SRV_INF("ATK patch 4: host self-cond %s | noise_text table: %zu of %d tokens | pad token: %d | canvas <= %d\n",
+            srv.host_self_cond ? "ON (lab mode: margin/temp_pos_gain/rep_penalty/sc_sharpen/lateral_noise/readout_sc/sc seed/soft_hold available)"
+                               : "off (launch with --no-diffusion-device-selfcond for the host self-cond features)",
+            srv.noise_text_ids.size(), srv.n_vocab, srv.pad_token, srv.canvas_length);
     const bool default_topk_gpu_ok = topk_max_requested <= 0 || topk_max_requested <= GPU_SAMPLING_MAX_TOP_K;
 
     const uint32_t default_seed = params.sampling.seed == LLAMA_DEFAULT_SEED ? 1234u : params.sampling.seed;
@@ -1437,7 +2077,20 @@ int main(int argc, char ** argv) {
                 {"top_k_tail_correction", srv.topk_tail},
             }},
             // ATK patch 2: what this build accepts beyond the PR's own server
-            {"atk", {{"patch", 2}, {"canvas", true}, {"readout", true}, {"sampler", true}, {"prompt_cache", true}}},
+            {"atk", {
+                {"patch", 4}, {"canvas", true}, {"readout", true}, {"sampler", true}, {"prompt_cache", true},
+                // ATK patch 4: what a client can rely on, and what needs the host self-cond launch flag
+                {"host_self_cond", srv.host_self_cond},
+                {"host_self_cond_features", json::array({"accept_order=margin", "temp_pos_gain", "rep_penalty", "sc_sharpen",
+                                                         "lateral_noise", "atk_readout_sc", "atk_canvas.self_cond", "atk_canvas.soft_hold"})},
+                {"canvas_length_max", srv.canvas_length},
+                {"noise_text_tokens", (int64_t) srv.noise_text_ids.size()},
+                {"pad_token", srv.pad_token},
+                {"features", json::array({"canvas_length", "stability_steps", "eog_tail", "eog_tail_pad", "noise_text", "noise_clear_sc",
+                                          "demolish_clear_sc", "sprint", "pos_bias", "accept_order", "bound_end", "temp_pos_gain",
+                                          "rep_penalty", "sc_sharpen", "lateral_noise", "osc_hold", "n_candidates", "atk_readout_sc",
+                                          "atk_canvas.self_cond", "atk_canvas.soft_hold", "atk_trajectory_text", "atk_stream_steps"})},
+            }},
             {"total_slots", 1},
             {"model_path", srv.model_path},
             {"model_alias", srv.model_id},
@@ -1563,12 +2216,41 @@ int main(int argc, char ** argv) {
     }
 
     // shared: run one generation (under the slot mutex), update metrics, print timing log
+    // ATK patch 4: best-of-N -- n_candidates runs with seeds seed, seed+1, ...; the prompt's KV is
+    // reused across them, the canvas with the lowest best mean entropy is returned, and every
+    // candidate's answer goes out in "atk_candidates" so a verifier can choose differently.
     auto run_for_body = [&srv, default_seed](const json & body, const std::vector<llama_token> & prompt_tokens,
                                              const diffusion_hooks * hooks = nullptr) {
         diffusion_request rq = request_from_body(body, srv, default_seed);
         srv.metrics.n_processing.fetch_add(1);
         std::unique_lock<std::mutex> lock(srv.gen_mutex);
-        diffusion_result r = srv.generate(prompt_tokens, rq, hooks);
+        diffusion_result r;
+        if (rq.n_candidates <= 1) {
+            r = srv.generate(prompt_tokens, rq, hooks);
+        } else {
+            json cands = json::array();
+            int best = -1; float best_ent = INFINITY;
+            std::vector<diffusion_result> results;
+            for (int c = 0; c < rq.n_candidates; ++c) {
+                diffusion_request rc = rq;
+                rc.seed = rq.seed + (uint32_t) c;
+                results.push_back(srv.generate(prompt_tokens, rc, hooks));
+                const diffusion_result & rr = results.back();
+                if (!rr.ok) { r = rr; break; }
+                const float ent = rr.has_readout ? rr.canvas0_best_entropy : INFINITY;
+                cands.push_back(json{{"seed", rc.seed}, {"answer", rr.answer}, {"best_entropy", ent},
+                                     {"last_entropy", rr.canvas0_last_entropy}, {"steps", rr.n_steps_total},
+                                     {"hit_eog", rr.hit_eog}, {"from_best", rr.canvas0_from_best}});
+                if (ent < best_ent) { best_ent = ent; best = c; }
+                SRV_INF("candidate %d/%d (seed %u): best entropy %.4f, %d steps%s\n", c + 1, rq.n_candidates, rc.seed, ent, rr.n_steps_total,
+                        best == c ? " <- best so far" : "");
+            }
+            if (best >= 0 && (results.empty() || results.back().ok)) {
+                r = results[best];
+                for (size_t c = 0; c < cands.size(); ++c) cands[c]["chosen"] = (int) c == best;
+                r.candidates = cands;
+            }
+        }
         lock.unlock();
         srv.metrics.n_processing.fetch_sub(1);
         if (r.ok) { srv.metrics.add(r); log_timings(r); }
@@ -1600,6 +2282,9 @@ int main(int argc, char ** argv) {
                 {"usage", usage_json(r)},
                 {"timings", timings_json(r)},
             };
+            // ATK patch 4: the chat endpoint carries the same extras as /v1/completions
+            if (r.has_readout) out["atk_canvas_out"] = readout_json(srv, r);
+            if (!r.candidates.empty()) out["atk_candidates"] = r.candidates;
             // ATK patch 2: replace, never throw, on a reply that ends inside a UTF-8 character
             res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
             return;
@@ -1661,6 +2346,7 @@ int main(int argc, char ** argv) {
                 {"timings", timings_json(r)},
             };
             if (r.has_readout) out["atk_canvas_out"] = readout_json(srv, r);
+            if (!r.candidates.empty()) out["atk_candidates"] = r.candidates;   // ATK patch 4
             // ATK patch 2: a reply can end inside a UTF-8 character (a canvas boundary, a byte-
             // fallback token); dump() would throw on it, so such bytes become U+FFFD instead
             res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
@@ -1685,6 +2371,17 @@ int main(int argc, char ** argv) {
                 diffusion_hooks hooks;
                 hooks.on_step = [&](int block, int step, int n_steps) {
                     return send(json{{"atk_progress", {{"block", block}, {"step", step}, {"n_steps", n_steps}}}});
+                };
+                // ATK patch 4: the canvas after every denoising step (atk_stream_steps) -- the text as
+                // the model currently reads it, its mean entropy, and per-position entropy so a client
+                // can colour each span by confidence while it watches the answer resolve
+                hooks.on_step_done = [&](int block, int step, const std::vector<llama_token> & argmax,
+                                         const std::vector<float> & entropy, float mean_entropy, int accepted) {
+                    return send(json{{"atk_step", {
+                        {"block", block}, {"step", step},
+                        {"text", common_detokenize(srv.vocab, argmax, false)},
+                        {"mean_entropy", mean_entropy}, {"accepted", accepted}, {"entropy", entropy},
+                    }}});
                 };
                 std::vector<llama_token> so_far;
                 const llama_token chan_open  = diffusion_single_token(srv.vocab, "<|channel>");
@@ -1713,6 +2410,7 @@ int main(int argc, char ** argv) {
                              {"choices", json::array({ final_choice(r) })},
                              {"usage", usage_json(r)}, {"timings", timings_json(r)}};
                     if (r.has_readout) fin["atk_canvas_out"] = readout_json(srv, r);
+                    if (!r.candidates.empty()) fin["atk_candidates"] = r.candidates;   // ATK patch 4
                     send(fin);
                 }
                 const std::string done = "data: [DONE]\n\n";

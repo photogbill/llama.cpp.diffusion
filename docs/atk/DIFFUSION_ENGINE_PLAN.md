@@ -123,3 +123,19 @@ same diversity for free.
 3, 4, 5, 6, then 7 behind a bench result. Branch `atk/diffusion-gemma`:
 the PR at its pinned commit as real history, patch 2 as commits, the
 getter pointed at the fork.
+
+## Status (2026-10-23, after patch 4)
+- 2, 3, 4, 8: done in patch 3.
+- 1: done in patch 4 as the stateless form — `atk_readout_sc` returns the
+  self-conditioning, `atk_canvas.self_cond` seeds it, `noise_map` re-noises
+  the rejected spans (lab mode).
+- 5: the one-canvas form (`osc_*`, oscillation hold) in patch 4; the forking
+  form still needs the step body refactored into a function.
+- 6: done in patch 4 (`rep_*`, lab mode).
+- 7: not started; needs a bench result first.
+- Added in patch 4 beyond this list: launch-flag passthrough, per-request
+  canvas length, post-EOG tail, text-only noise, self-cond forgetting,
+  sprint, acceptance order/budget schedules, per-position temperature,
+  self-cond sharpening, lateral noise, best-of-N, soft holds, per-step
+  streaming. Every one is opt-in and documented in `CHANGES.md` with the
+  bench it must earn.

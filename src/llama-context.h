@@ -131,6 +131,7 @@ struct llama_context {
 
     // diffusion: sparse (top-k) self-conditioning (top-k token ids + probs per position)
     void set_diffusion_self_cond_topk(const int32_t * ids, const float * probs, int64_t k, int64_t n_tokens);
+    int32_t diffusion_self_cond_clear(const int32_t * positions, int32_t n_positions); // ATK patch 4
 
     bool diffusion_sample_topk_supported() const;
     void set_diffusion_gpu_sampling(bool enabled);
